@@ -27,6 +27,12 @@ Precedence (first wins):
 ## Install
 
 ```bash
+pi install npm:pi-project-switcher
+```
+
+Or from git:
+
+```bash
 pi install git:github.com/stefclawd/pi-project-switcher
 ```
 
@@ -41,6 +47,10 @@ pi install ./pi-project-switcher
 Single-file TypeScript extension (`index.ts`), loaded directly by pi via jiti — no build step. Spec lives in `openspec/specs/project-switching/`.
 
 ```bash
+npm install
+npm test        # vitest (17 tests)
+npm run typecheck
+
 # Run once without installing
 pi -e ./index.ts
 
