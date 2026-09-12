@@ -33,8 +33,8 @@ The base directory SHALL be configurable. Default is `~/dev`. Configuration sour
 3. Announcing the switch to the agent (context message)
 
 #### Scenario: Successful switch
-- **WHEN** the user runs `/project floop` and `~/dev/floop` exists
-- **THEN** the session name is set to include "floop" and the agent is told the new working context
+- **WHEN** the user runs `/project foo` and `~/dev/foo` exists
+- **THEN** the session name is set to include "foo" and the agent is told the new working context
 
 #### Scenario: Unknown project
 - **WHEN** the user runs `/project doesnotexist`
@@ -51,8 +51,8 @@ While a project is active, every agent turn SHALL receive the project path in th
 On session start, if no persisted project exists, the extension SHALL try to detect the active project from the current working directory (session cwd inside base dir).
 
 #### Scenario: Start from project directory
-- **WHEN** pi is started with cwd `~/dev/floop`
-- **THEN** "floop" is active without user interaction
+- **WHEN** pi is started with cwd `~/dev/foo`
+- **THEN** "foo" is active without user interaction
 
 #### Scenario: Start outside base dir
 - **WHEN** pi is started with cwd outside the base directory
