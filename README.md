@@ -6,9 +6,11 @@ A [pi coding agent](https://github.com/earendil-works/pi) extension to switch be
 
 - **`/project`** — list all projects (direct subdirectories of the base dir) with git branch info, mark the active one
 - **`/project <name>`** — switch the active project:
+  - restores the project's last session if one is stored (see below)
   - persists across reloads (session entry)
   - sets the session display name
   - injects the project path into every agent turn's system prompt, so file operations default to the active project
+- **Session restore** — a machine-local map (`~/.pi/agent/project-switcher-sessions.json`) remembers the most recent session per project. Switching projects returns you to that project's last session; if none exists (or the file is gone), the switch happens in the current session.
 - **Auto-detection** — if pi starts inside `~/dev/<project>`, that project is active automatically
 
 Every direct subdirectory of the base directory counts as a project. **Git is not required.** Hidden directories are ignored.

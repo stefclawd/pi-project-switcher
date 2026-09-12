@@ -7,7 +7,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -59,14 +59,31 @@ function createFakePi(): { pi: any; recorded: Recorded; handlers: Map<string, Ha
 function createFakeCtx(overrides: Record<string, any> = {}) {
   return {
     cwd: process.cwd(),
-    sessionManager: { getEntries: () => [] as any[] },
+    sessionManager: {
+      getEntries: () => [] as any[],
+      getSessionFile: () => undefined as string | undefined,
+    },
     ui: {
       notify: vi.fn(),
     },
+    switchSession: vi.fn(async (_path: string) => ({ cancelled: false })),
     waitForIdle: vi.fn(async () => {}),
     isIdle: () => true,
     ...overrides,
   };
+}
+
+/** Create a fake session file inside the fake sessions dir and return its absolute path. */
+function makeFakeSession(name: string): string {
+  const dir = join(fakeHome, ".pi", "agent", "sessions");
+  mkdirSync(dir, { recursive: true });
+  const file = join(dir, name);
+  writeFileSync(file, "{}\n", "utf8");
+  return file;
+}
+
+function readSessionMap(): any {
+  return JSON.parse(readFileSync(sessionMapPath, "utf8"));
 }
 
 async function loadExtension() {
@@ -79,6 +96,9 @@ async function loadExtension() {
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 let baseDir: string;
+let fakeHome: string;
+let sessionMapPath: string;
+let realHome: string;
 
 function makeProjects(names: string[]): void {
   for (const name of names) {
@@ -97,12 +117,25 @@ async function fire(event: string, handlers: Map<string, Handler>, payload: any,
 beforeEach(() => {
   baseDir = mkdtempSync(join(tmpdir(), "ppswitch-"));
   process.env.PI_PROJECT_SWITCHER_BASE = baseDir;
+
+  // The extension resolves ~/.pi/agent paths from os.homedir() at module
+  // load. Point HOME at a temp dir so tests never touch the real map.
+  // loadExtension() calls vi.resetModules() -> constants re-evaluate.
+  fakeHome = mkdtempSync(join(tmpdir(), "ppswitch-home-"));
+  mkdirSync(join(fakeHome, ".pi", "agent"), { recursive: true });
+  sessionMapPath = join(fakeHome, ".pi", "agent", "project-switcher-sessions.json");
+  realHome = process.env.HOME ?? "";
+  process.env.HOME = fakeHome;
+  vi.resetModules();
 });
 
 afterEach(() => {
   delete process.env.PI_PROJECT_SWITCHER_BASE;
-  if (baseDir && existsSync(baseDir)) {
-    rmSync(baseDir, { recursive: true, force: true });
+  process.env.HOME = realHome;
+  for (const dir of [baseDir, fakeHome]) {
+    if (dir && existsSync(dir)) {
+      rmSync(dir, { recursive: true, force: true });
+    }
   }
 });
 
@@ -199,9 +232,7 @@ describe("/project switching", () => {
     expect(ctx.waitForIdle).toHaveBeenCalled();
     expect(recorded.userMessages).toHaveLength(1);
     expect(recorded.userMessages[0].content).toContain("**beta**");
-  });
-
-  it("rejects an unknown project and keeps state", async () => {
+  });  it("rejects an unknown project and keeps state", async () => {
     makeProjects(["alpha"]);
     const { pi, recorded } = createFakePi();
     const { default: factory } = await loadExtension();
@@ -270,6 +301,7 @@ describe("session_start restore & auto-detect", () => {
         getEntries: () => [
           { type: "custom", customType: "project-switcher-state", data: { project: "beta" } },
         ],
+        getSessionFile: () => undefined as string | undefined,
       },
       cwd: join(baseDir, "alpha"), // cwd says alpha, persisted entry wins
     });
@@ -367,6 +399,164 @@ describe("configuration precedence", () => {
     const ctx = createFakeCtx();
     await cmd.options.handler("", ctx);
     expect(ctx.ui.notify).toHaveBeenCalled();
+  });
+});
+
+describe("session map persistence", () => {
+  it("stores the current session under the previous project on switch", async () => {
+    makeProjects(["alpha", "beta"]);
+    const sessionFile = makeFakeSession("sess-alpha.jsonl");
+
+    const { pi, recorded, handlers } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    // start on alpha (cwd auto-detect)
+    const startCtx = createFakeCtx({
+      sessionManager: {
+        getEntries: () => [] as any[],
+        getSessionFile: () => sessionFile,
+      },
+      cwd: join(baseDir, "alpha"),
+    });
+    await fire("session_start", handlers, { type: "session_start" }, startCtx);
+
+    // no stored session for beta -> same-session switch
+    const cmd = recorded.commands.find((c) => c.name === "project")!;
+    await cmd.options.handler("beta", createFakeCtx({
+      sessionManager: {
+        getEntries: () => [] as any[],
+        getSessionFile: () => sessionFile,
+      },
+    }));
+
+    const map = readSessionMap();
+    expect(map.alpha.sessionFile).toContain("sess-alpha.jsonl");
+    expect(map.alpha.updatedAt).toBeTruthy();
+  });
+
+  it("restores the stored session of the target project", async () => {
+    makeProjects(["alpha", "beta"]);
+    const betaSession = makeFakeSession("2026-09-12-beta.jsonl");
+
+    const { pi, recorded } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    // Pre-seed the map: beta -> its session file (relative to ~/.pi/agent/sessions/)
+    writeFileSync(
+      sessionMapPath,
+      JSON.stringify({
+        beta: { sessionFile: "2026-09-12-beta.jsonl", updatedAt: "x" },
+      }),
+      "utf8"
+    );
+
+    const cmd = recorded.commands.find((c) => c.name === "project")!;
+    const ctx = createFakeCtx();
+    await cmd.options.handler("beta", ctx);
+
+    expect(ctx.switchSession).toHaveBeenCalledWith(betaSession);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("session: 2026-09-12-beta.jsonl"),
+      "info"
+    );
+  });
+
+  it("falls back to same-session switch when stored session file is gone", async () => {
+    makeProjects(["alpha", "beta"]);
+
+    const { pi, recorded } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    // Map points to a file that does not exist
+    writeFileSync(
+      sessionMapPath,
+      JSON.stringify({
+        beta: { sessionFile: "gone.jsonl", updatedAt: "x" },
+      }),
+      "utf8"
+    );
+
+    const cmd = recorded.commands.find((c) => c.name === "project")!;
+    const ctx = createFakeCtx();
+    await cmd.options.handler("beta", ctx);
+
+    expect(ctx.switchSession).not.toHaveBeenCalled();
+    expect(recorded.userMessages).toHaveLength(1); // follow-up announcement (same-session path)
+  });
+
+  it("rolls back when switchSession is cancelled", async () => {
+    makeProjects(["alpha", "beta"]);
+    makeFakeSession("beta-session.jsonl");
+    writeFileSync(
+      sessionMapPath,
+      JSON.stringify({
+        beta: { sessionFile: "beta-session.jsonl", updatedAt: "x" },
+      }),
+      "utf8"
+    );
+
+    const { pi, recorded, handlers } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    // start on alpha
+    const startCtx = createFakeCtx({ cwd: join(baseDir, "alpha") });
+    await fire("session_start", handlers, { type: "session_start" }, startCtx);
+
+    const cmd = recorded.commands.find((c) => c.name === "project")!;
+    const ctx = createFakeCtx({
+      switchSession: vi.fn(async () => ({ cancelled: true })),
+    });
+    await cmd.options.handler("beta", ctx);
+
+    // stayed on alpha: prompt injection still says alpha
+    const result = await fire(
+      "before_agent_start",
+      handlers,
+      { type: "before_agent_start", prompt: "hi", systemPrompt: "BASE" },
+      createFakeCtx()
+    );
+    expect(result.systemPrompt).toContain("alpha");
+  });
+
+  it("ignores malformed session map entries", async () => {
+    makeProjects(["alpha", "beta"]);
+    writeFileSync(sessionMapPath, JSON.stringify({ beta: { nope: true }, gamma: "garbage" }), "utf8");
+
+    const { pi, recorded } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    const cmd = recorded.commands.find((c) => c.name === "project")!;
+    const ctx = createFakeCtx();
+    await cmd.options.handler("beta", ctx);
+
+    expect(ctx.switchSession).not.toHaveBeenCalled();
+    expect(recorded.userMessages).toHaveLength(1);
+  });
+
+  it("does not persist sessions that live outside ~/.pi/agent/sessions", async () => {
+    makeProjects(["alpha", "beta"]);
+    const outside = join(baseDir, "alpha", "some-session.jsonl");
+    writeFileSync(outside, "{}", "utf8");
+
+    const { pi, recorded, handlers } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    const startCtx = createFakeCtx({
+      sessionManager: {
+        getEntries: () => [] as any[],
+        getSessionFile: () => outside,
+      },
+      cwd: join(baseDir, "alpha"),
+    });
+    await fire("session_start", handlers, { type: "session_start" }, startCtx);
+
+    expect(existsSync(sessionMapPath)).toBe(false);
   });
 });
 

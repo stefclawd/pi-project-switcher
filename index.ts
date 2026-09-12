@@ -6,25 +6,40 @@
  *
  * Commands:
  *   /project          - Show active project + list all discovered projects
- *   /project <name>   - Switch active project
+ *   /project <name>   - Switch active project (restores its last session)
  *
  * Configuration (precedence):
  *   1. ~/.pi/agent/project-switcher.json  { "baseDir": "..." }
  *   2. PI_PROJECT_SWITCHER_BASE env var
  *   3. Default: ~/dev
+ *
+ * Session map (project -> session file, machine-local):
+ *   ~/.pi/agent/project-switcher-sessions.json
+ *   Session paths stored relative to ~/.pi/agent/sessions/ for portability.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { execSync } from "node:child_process";
-import { existsSync, readdirSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, join, relative, resolve } from "node:path";
 
 const HOME = homedir();
 const ENTRY_TYPE = "project-switcher-state";
+const SESSIONS_DIR = join(HOME, ".pi", "agent", "sessions");
+const SESSION_MAP_PATH = join(HOME, ".pi", "agent", "project-switcher-sessions.json");
 
 interface Config {
   baseDir: string;
+}
+
+/** project name -> persisted session state */
+interface SessionMap {
+  [project: string]: {
+    /** Session file path, relative to ~/.pi/agent/sessions/ */
+    sessionFile: string;
+    updatedAt: string;
+  };
 }
 
 function loadConfig(): Config {
@@ -32,8 +47,7 @@ function loadConfig(): Config {
   const settingsPath = join(HOME, ".pi", "agent", "project-switcher.json");
   if (existsSync(settingsPath)) {
     try {
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const raw = JSON.parse(require("node:fs").readFileSync(settingsPath, "utf8"));
+      const raw = JSON.parse(readFileSync(settingsPath, "utf8"));
       if (typeof raw.baseDir === "string" && raw.baseDir) {
         return { baseDir: resolve(raw.baseDir) };
       }
@@ -81,6 +95,81 @@ function getGitBranch(path: string): string {
   }
 }
 
+// ── Session map (project -> session file) ─────────────────────────────────
+
+function loadSessionMap(): SessionMap {
+  try {
+    const raw = JSON.parse(readFileSync(SESSION_MAP_PATH, "utf8"));
+    if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+      // keep only well-formed entries
+      const map: SessionMap = {};
+      for (const [project, value] of Object.entries(raw)) {
+        if (
+          value &&
+          typeof value === "object" &&
+          typeof (value as any).sessionFile === "string" &&
+          (value as any).sessionFile
+        ) {
+          map[project] = {
+            sessionFile: (value as any).sessionFile,
+            updatedAt: typeof (value as any).updatedAt === "string" ? (value as any).updatedAt : "",
+          };
+        }
+      }
+      return map;
+    }
+  } catch {
+    // missing/corrupt file -> empty map
+  }
+  return {};
+}
+
+function saveSessionMap(map: SessionMap): void {
+  const dir = join(HOME, ".pi", "agent");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(SESSION_MAP_PATH, JSON.stringify(map, null, 2) + "\n", "utf8");
+}
+
+/** Resolve a stored relative session file to its absolute path. */
+function resolveSessionFile(relPath: string): string {
+  const abs = resolve(SESSIONS_DIR, relPath);
+  // Guard: stored path must stay inside the sessions dir
+  const rel = relative(SESSIONS_DIR, abs);
+  if (rel.startsWith("..") || resolve(rel) === SESSIONS_DIR) {
+    return abs; // resolve() already clamps to sessions dir via resolve(), re-checked by caller via existsSync
+  }
+  return abs;
+}
+
+/** Convert an absolute session file path to the relative form we store. */
+function toRelativeSessionFile(absPath: string): string | null {
+  const rel = relative(SESSIONS_DIR, resolve(absPath));
+  if (!rel || rel.startsWith("..")) {
+    return null; // session lives outside the default sessions dir -> don't persist
+  }
+  return rel;
+}
+
+function getMappedSessionFile(project: string): string | null {
+  const map = loadSessionMap();
+  const entry = map[project];
+  if (!entry) {
+    return null;
+  }
+  const abs = resolveSessionFile(entry.sessionFile);
+  return existsSync(abs) ? abs : null;
+}
+
+function rememberSessionFile(project: string, absSessionFile: string): void {
+  const rel = toRelativeSessionFile(absSessionFile);
+  if (!rel) {
+    return;
+  }
+  const map = loadSessionMap();
+  map[project] = { sessionFile: rel, updatedAt: new Date().toISOString() };
+  saveSessionMap(map);
+}
+
 let activeProject: string | null = null;
 let config: Config | null = null;
 
@@ -125,8 +214,13 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
+    // Keep the session map fresh: current session belongs to the active project
     if (activeProject) {
       pi.setSessionName(activeProject);
+      const sessionFile = ctx.sessionManager.getSessionFile();
+      if (sessionFile) {
+        rememberSessionFile(activeProject, sessionFile);
+      }
     }
   });
 
@@ -200,6 +294,46 @@ export default function (pi: ExtensionAPI) {
       }
 
       const previous = activeProject;
+
+      // Remember the current session under the PREVIOUS project before switching
+      const currentSessionFile = ctx.sessionManager.getSessionFile();
+      if (previous && currentSessionFile) {
+        rememberSessionFile(previous, currentSessionFile);
+      }
+
+      // Try to restore the target project's last session
+      const targetSession = getMappedSessionFile(name);
+
+      if (targetSession) {
+        // Persist the switch in the OLD session before replacing it
+        pi.appendEntry(ENTRY_TYPE, { project: name, switchedAt: new Date().toISOString() });
+
+        const result = await ctx.switchSession(targetSession);
+        if (result.cancelled) {
+          // User cancelled; roll back in-memory state
+          activeProject = previous;
+          ctx.ui.notify(`Switch cancelled. Staying on ${previous ?? "no project"}.`, "info");
+          return;
+        }
+
+        // switchSession fires a new session_start, which restores state from
+        // the target session's entries (or auto-detects). Set it explicitly as
+        // a safety net in case the session has no project entry yet.
+        activeProject = name;
+        pi.setSessionName(name);
+        rememberSessionFile(name, targetSession);
+
+        const path = projectPath(name);
+        const branch = getGitBranch(path);
+        const branchStr = branch ? ` on branch \`${branch}\`` : "";
+        ctx.ui.notify(
+          `Switched to ${name} (session: ${basename(targetSession)})\n${path}${branchStr ? ` ${branchStr}` : ""}`,
+          "info"
+        );
+        return;
+      }
+
+      // ── Fallback: no stored session (or file gone) -> same-session switch ─
       activeProject = name;
 
       // Persist to session

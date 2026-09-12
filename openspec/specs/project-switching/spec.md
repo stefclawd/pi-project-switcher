@@ -57,3 +57,22 @@ On session start, if no persisted project exists, the extension SHALL try to det
 #### Scenario: Start outside base dir
 - **WHEN** pi is started with cwd outside the base directory
 - **THEN** no project is active; `/project` lists available ones
+
+### Requirement: Session Restore on Project Switch
+The extension SHALL maintain a machine-local session map (`~/.pi/agent/project-switcher-sessions.json`) mapping each project to its most recent session file, stored relative to `~/.pi/agent/sessions/`. On `/project <name>`, if the target project has a stored session file that still exists, the extension SHALL switch to that session via `switchSession()`; otherwise it SHALL fall back to switching context within the current session.
+
+#### Scenario: Target project has a stored session
+- **WHEN** the user runs `/project beta` and beta has a stored, existing session file
+- **THEN** pi switches to that session file and the active project becomes beta
+
+#### Scenario: Stored session file no longer exists
+- **WHEN** the target project's mapped session file was deleted
+- **THEN** the switch happens in the current session (context injection only)
+
+#### Scenario: Session lives outside the sessions dir
+- **WHEN** the current session file is not under `~/.pi/agent/sessions/`
+- **THEN** it is not persisted to the session map
+
+#### Scenario: Switch is cancelled
+- **WHEN** `switchSession()` reports cancellation (e.g. user aborts)
+- **THEN** the active project remains unchanged
