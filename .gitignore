@@ -17,7 +17,8 @@
 .devin/
 .factory/
 .forge/
-.github/
+# .github/ is NOT ignored: workflows live in the repo
+# .github/
 .gemini/
 .hermes/
 .iflow/
