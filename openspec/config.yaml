@@ -1,0 +1,19 @@
+schema: spec-driven
+
+context: |
+  Project: pi-project-switcher — a pi coding agent extension (TypeScript, single index.ts, no build step).
+  Runtime: pi (@earendil-works/pi-coding-agent), loaded from ~/.pi/agent/extensions/ or installed via `pi install`.
+  
+  Purpose: Switch between projects under a configurable base directory.
+  Each direct subdirectory of the base dir is a project (git optional, NOT required).
+  
+  Key requirements from maintainer:
+  1. Telegram visibility is NOT relevant — target usage is pi TUI/RPC.
+  2. Only the base directory is configured (default ~/dev). Every direct
+     subdirectory = project, discovered dynamically (no hardcoded project list).
+  3. /project command: show current, list all, switch.
+  4. Switch = set active project + inject project context into system prompt
+     via before_agent_start + session naming.
+  
+  Conventions: TypeScript loaded directly via jiti (no compilation),
+  MIT license, conventional commits.

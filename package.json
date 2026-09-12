@@ -1,0 +1,12 @@
+{
+  "name": "pi-project-switcher",
+  "version": "0.1.0",
+  "description": "pi coding agent extension: switch between projects under a configurable base directory via /project",
+  "main": "index.ts",
+  "scripts": {
+    "test": "echo \"no tests yet\" && exit 0"
+  },
+  "keywords": ["pi", "pi-extension", "project", "switcher"],
+  "license": "MIT",
+  "files": ["index.ts", "README.md", "LICENSE"]
+}
