@@ -29,6 +29,11 @@ When the named project does not exist under the base directory, the command SHAL
 - **AND** the user declines the offered creation (or dismissal/cancellation is treated as decline)
 - **THEN** a warning is shown, no folder is created, and the active project remains unchanged
 
+#### Scenario: Unknown project
+
+- **WHEN** the user runs `/project doesnotexist` on a non-dialog surface without the `!` opt-in
+- **THEN** an error is shown and the active project remains unchanged
+
 #### Scenario: Unknown project on non-dialog surface without opt-in
 
 - **WHEN** `/project foo` targets a non-existent project on a surface without dialog capability
