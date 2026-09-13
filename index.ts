@@ -22,7 +22,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { execSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, join, relative, resolve } from "node:path";
+import { basename, isAbsolute, join, relative, resolve } from "node:path";
 
 const HOME = homedir();
 const ENTRY_TYPE = "project-switcher-state";
@@ -189,6 +189,26 @@ function isValidProject(name: string): boolean {
   return projects.includes(name);
 }
 
+/** True when a name is safe to materialize as a single directory under the base dir. */
+function isSafeProjectName(name: string): boolean {
+  if (!name || name === "." || name === "..") {
+    return false;
+  }
+  if (name.startsWith(".")) {
+    return false; // hidden
+  }
+  if (name.includes("/") || name.includes("\\")) {
+    return false; // no path segments
+  }
+  if (name.includes("..")) {
+    return false; // no traversal
+  }
+  if (isAbsolute(name)) {
+    return false; // absolute paths
+  }
+  return true;
+}
+
 export default function (pi: ExtensionAPI) {
   // ── Restore state on session start ──────────────────────────────────────
   pi.on("session_start", async (_event, ctx) => {
@@ -255,7 +275,13 @@ export default function (pi: ExtensionAPI) {
     },
 
     handler: async (args, ctx) => {
-      const name = args.trim();
+      let name = args.trim();
+
+      // ── Explicit create opt-in: trailing "!" on the project name ────────
+      const createOptIn = name.endsWith("!");
+      if (createOptIn) {
+        name = name.slice(0, -1).trim();
+      }
 
       // ── No arg: show status ──────────────────────────────────────────────
       if (!name) {
@@ -280,12 +306,46 @@ export default function (pi: ExtensionAPI) {
 
       // ── Switch project ────────────────────────────────────────────────────
       if (!isValidProject(name)) {
-        const available = discoverProjects(getConfig().baseDir).join(", ");
-        ctx.ui.notify(
-          `Unknown project: "${name}".\nAvailable: ${available || "(none)"}`,
-          "warning"
-        );
-        return;
+        // Offer to create the folder and switch to it (never silently)
+        if (isSafeProjectName(name)) {
+          let create = false;
+          if (createOptIn) {
+            create = true;
+          } else if (ctx.hasUI) {
+            try {
+              create = await ctx.ui.confirm(
+                "Create project?",
+                `Project "${name}" does not exist. Create ${join(getConfig().baseDir, name)} and switch to it?`
+              );
+            } catch {
+              create = false;
+            }
+          }
+
+          if (create) {
+            const newPath = projectPath(name);
+            try {
+              mkdirSync(newPath, { recursive: false });
+              ctx.ui.notify(`Created project folder: ${newPath}`, "info");
+            } catch (err: any) {
+              ctx.ui.notify(
+                `Failed to create project folder ${newPath}: ${err?.message ?? err}`,
+                "error"
+              );
+              return;
+            }
+            // fall through: the folder now exists and the switch proceeds below
+          }
+        }
+
+        if (!isValidProject(name)) {
+          const available = discoverProjects(getConfig().baseDir).join(", ");
+          ctx.ui.notify(
+            `Unknown project: "${name}".\nAvailable: ${available || "(none)"}`,
+            "warning"
+          );
+          return;
+        }
       }
 
       if (name === activeProject) {

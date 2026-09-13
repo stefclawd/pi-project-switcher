@@ -59,12 +59,14 @@ function createFakePi(): { pi: any; recorded: Recorded; handlers: Map<string, Ha
 function createFakeCtx(overrides: Record<string, any> = {}) {
   return {
     cwd: process.cwd(),
+    hasUI: true,
     sessionManager: {
       getEntries: () => [] as any[],
       getSessionFile: () => undefined as string | undefined,
     },
     ui: {
       notify: vi.fn(),
+      confirm: vi.fn(async () => false),
     },
     switchSession: vi.fn(async (_path: string) => ({ cancelled: false })),
     waitForIdle: vi.fn(async () => {}),
@@ -569,6 +571,124 @@ describe("session map persistence", () => {
     await fire("session_start", handlers, { type: "session_start" }, startCtx);
 
     expect(existsSync(sessionMapPath)).toBe(false);
+  });
+});
+
+describe("create project on unknown name", () => {
+  it("creates the folder and switches after user confirms", async () => {
+    makeProjects(["alpha"]);
+    const { pi, recorded } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    const ctx = createFakeCtx({
+      ui: { notify: vi.fn(), confirm: vi.fn(async () => true) },
+    });
+    const cmd = recorded.commands.find((c) => c.name === "project")!;
+    await cmd.options.handler("newproj", ctx);
+
+    expect(existsSync(join(baseDir, "newproj"))).toBe(true);
+    const msgs = (ctx.ui.notify as ReturnType<typeof vi.fn>).mock.calls.map((c: any[]) => c[0]);
+    expect(msgs.some((m: string) => m.includes("Created project folder:"))).toBe(true);
+    expect(msgs.some((m: string) => m.includes("Switched to newproj"))).toBe(true);
+    expect(msgs.some((m: string) => m.includes("first session in this project"))).toBe(true);
+  });
+
+  it("warns and creates nothing when user declines", async () => {
+    makeProjects(["alpha"]);
+    const { pi, recorded } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    const ctx = createFakeCtx({
+      ui: { notify: vi.fn(), confirm: vi.fn(async () => false) },
+    });
+    const cmd = recorded.commands.find((c) => c.name === "project")!;
+    await cmd.options.handler("newproj", ctx);
+
+    expect(existsSync(join(baseDir, "newproj"))).toBe(false);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining('Unknown project: "newproj"'),
+      "warning"
+    );
+    expect(recorded.sessionNames).toHaveLength(0);
+  });
+
+  it("creates without dialog via explicit '!' opt-in on headless surfaces", async () => {
+    makeProjects(["alpha"]);
+    const { pi, recorded } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    const ctx = createFakeCtx({ hasUI: false });
+    const cmd = recorded.commands.find((c) => c.name === "project")!;
+    await cmd.options.handler("newproj!", ctx);
+
+    expect(existsSync(join(baseDir, "newproj"))).toBe(true);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("Created project folder:"),
+      "info"
+    );
+    expect(recorded.sessionNames).toContain("newproj");
+  });
+
+  it("never offers creation for unsafe names even with '!'", async () => {
+    makeProjects(["alpha"]);
+    const { pi, recorded } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    for (const unsafe of ["../x!", "a/b!", ".hidden!", "/abs!", "..!"]) {
+      const ctx = createFakeCtx({
+        ui: { notify: vi.fn(), confirm: vi.fn(async () => true) },
+      });
+      const cmd = recorded.commands.find((c) => c.name === "project")!;
+      await cmd.options.handler(unsafe, ctx);
+
+      expect(ctx.ui.confirm).not.toHaveBeenCalled();
+      const msgs = (ctx.ui.notify as ReturnType<typeof vi.fn>).mock.calls.map((c: any[]) => c[0]);
+      expect(msgs.some((m: string) => m.includes("Unknown project"))).toBe(true);
+    }
+    expect(existsSync(join(baseDir, "x"))).toBe(false);
+    expect(existsSync(join(baseDir, "a"))).toBe(false);
+    expect(existsSync(join(baseDir, ".hidden"))).toBe(false);
+  });
+
+  it("reports mkdir failure and keeps state unchanged", async () => {
+    makeProjects(["alpha"]);
+    // occupy the name with a file so mkdir fails
+    writeFileSync(join(baseDir, "blocked"), "occupied", "utf8");
+
+    const { pi, recorded } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    const ctx = createFakeCtx({
+      ui: { notify: vi.fn(), confirm: vi.fn(async () => true) },
+    });
+    const cmd = recorded.commands.find((c) => c.name === "project")!;
+    await cmd.options.handler("blocked", ctx);
+
+    const msgs = (ctx.ui.notify as ReturnType<typeof vi.fn>).mock.calls.map((c: any[]) => c[0]);
+    expect(msgs.some((m: string) => m.includes("Failed to create project folder"))).toBe(true);
+    expect(recorded.sessionNames).toHaveLength(0);
+  });
+
+  it("headless without '!' keeps the plain warning", async () => {
+    makeProjects(["alpha"]);
+    const { pi, recorded } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    const ctx = createFakeCtx({ hasUI: false });
+    const cmd = recorded.commands.find((c) => c.name === "project")!;
+    await cmd.options.handler("newproj", ctx);
+
+    expect(existsSync(join(baseDir, "newproj"))).toBe(false);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining('Unknown project: "newproj"'),
+      "warning"
+    );
   });
 });
 
