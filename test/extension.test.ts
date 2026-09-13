@@ -215,7 +215,12 @@ describe("/project switching", () => {
     const { default: factory } = await loadExtension();
     factory(pi);
 
-    const ctx = createFakeCtx();
+    const ctx = createFakeCtx({
+      sessionManager: {
+        getEntries: () => [] as any[],
+        getSessionFile: () => "/some/other-session.jsonl" as string | undefined,
+      },
+    });
     const cmd = recorded.commands.find((c) => c.name === "project")!;
     await cmd.options.handler("beta", ctx);
 
@@ -228,6 +233,11 @@ describe("/project switching", () => {
       expect.stringContaining("Switched to beta"),
       "info"
     );
+    // First-session fallback wording + workdir line
+    const notifyMsg = (ctx.ui.notify as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
+    expect(notifyMsg).toContain("first session in this project");
+    expect(notifyMsg).toContain(`Workdir: ${join(baseDir, "beta")}`);
+    expect(notifyMsg).toContain("Continuing session: other-session.jsonl");
     // Agent announcement queued after idle
     expect(ctx.waitForIdle).toHaveBeenCalled();
     expect(recorded.userMessages).toHaveLength(1);
@@ -458,9 +468,11 @@ describe("session map persistence", () => {
 
     expect(ctx.switchSession).toHaveBeenCalledWith(betaSession);
     expect(ctx.ui.notify).toHaveBeenCalledWith(
-      expect.stringContaining("session: 2026-09-12-beta.jsonl"),
+      expect.stringContaining("session restored: 2026-09-12-beta.jsonl"),
       "info"
     );
+    const restoreMsg = (ctx.ui.notify as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
+    expect(restoreMsg).toContain(`Workdir: ${join(baseDir, "beta")}`);
   });
 
   it("falls back to same-session switch when stored session file is gone", async () => {

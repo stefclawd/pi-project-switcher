@@ -327,7 +327,8 @@ export default function (pi: ExtensionAPI) {
         const branch = getGitBranch(path);
         const branchStr = branch ? ` on branch \`${branch}\`` : "";
         ctx.ui.notify(
-          `Switched to ${name} (session: ${basename(targetSession)})\n${path}${branchStr ? ` ${branchStr}` : ""}`,
+          `Switched to ${name} — session restored: ${basename(targetSession)}\n` +
+          `Workdir: ${path}${branchStr ? ` ${branchStr}` : ""}`,
           "info"
         );
         return;
@@ -347,7 +348,18 @@ export default function (pi: ExtensionAPI) {
       const branchStr = branch ? ` on branch \`${branch}\`` : "";
       const fromStr = previous ? ` (was: ${previous})` : "";
 
-      ctx.ui.notify(`Switched to ${name}${fromStr}\n${path}${branchStr ? ` ${branchStr}` : ""}`, "info");
+      // Current session identity — still valid on this path (no session replacement)
+      const currentFile = currentSessionFile ?? ctx.sessionManager.getSessionFile();
+      const sessionLine = currentFile
+        ? `Continuing session: ${basename(currentFile)}`
+        : "Continuing current session";
+
+      ctx.ui.notify(
+        `Switched to ${name}${fromStr} — first session in this project\n` +
+        `Workdir: ${path}${branchStr ? ` ${branchStr}` : ""}\n` +
+        sessionLine,
+        "info"
+      );
 
       // Announce to the agent so it operates in the new context
       await ctx.waitForIdle();
