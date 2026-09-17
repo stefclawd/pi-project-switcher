@@ -8,10 +8,13 @@ context: |
   Each direct subdirectory of the base dir is a project (git optional, NOT required).
   
   Key requirements from maintainer:
-  1. Telegram visibility is NOT relevant — target usage is pi TUI/RPC.
+  1. Targets are BOTH native pi TUI/RPC sessions and remote use via the
+     pi-telegram bridge (with pi-telegram-command-bridge re-dispatching
+     extension commands). Surface-adaptive output is a core concern.
   2. Only the base directory is configured (default ~/dev). Every direct
      subdirectory = project, discovered dynamically (no hardcoded project list).
-  3. /project command: show current, list all, switch.
+  3. /project command: show current, list all, switch. Bare /project adapts
+     to the surface (TUI select dialog, Telegram buttons, plain list).
   4. Switch = set active project + inject project context into system prompt
      via before_agent_start + session naming.
   

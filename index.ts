@@ -173,6 +173,92 @@ function rememberSessionFile(project: string, absSessionFile: string): void {
 let activeProject: string | null = null;
 let config: Config | null = null;
 
+// ── Telegram origin detection (input event + flag) ───────────────────────────
+
+/**
+ * Matches a first line dispatched from the pi-telegram bridge: a
+ * `[telegram]` tag (optionally with attributes like `[telegram|thread:x]`)
+ * followed by a bare `/project` with no arguments.
+ */
+const TELEGRAM_STATUS_RE = /^\[telegram(?:\|[^\]]*)?\]\s*\/project\s*$/;
+
+/** How long an armed flag stays valid (ms). Guards against stale flags
+ *  from dispatches that never reached the command handler. */
+const TELEGRAM_FLAG_TTL_MS = 30_000;
+
+/** Armed-at timestamp of a pending Telegram-originated status request, or null. */
+let telegramStatusFlag: number | null = null;
+
+function armTelegramStatusFlag(): void {
+  telegramStatusFlag = Date.now();
+}
+
+/** Consume the flag: returns true (and clears it) when armed and not expired. */
+function consumeTelegramStatusFlag(): boolean {
+  if (telegramStatusFlag === null) return false;
+  const armed = telegramStatusFlag;
+  telegramStatusFlag = null;
+  return Date.now() - armed <= TELEGRAM_FLAG_TTL_MS;
+}
+
+function clearTelegramStatusFlag(): void {
+  telegramStatusFlag = null;
+}
+
+/**
+ * A project name that could alter button markup or the button prompt is
+ * rendered as plain list text only (never gets a button cell).
+ */
+function isUnsafeButtonName(name: string): boolean {
+  return /[{}|`\\\n]/.test(name);
+}
+
+/**
+ * Build the follow-up prompt for a Telegram-originated status request.
+ * Embeds the authoritative project list and a pre-rendered telegram_button
+ * block the agent copies verbatim into its reply.
+ */
+function buildTelegramStatusPrompt(projects: string[]): string {
+  const ordered = [...projects];
+  if (activeProject) {
+    const idx = ordered.indexOf(activeProject);
+    if (idx > 0) {
+      ordered.splice(idx, 1);
+      ordered.unshift(activeProject);
+    } else if (idx === -1) {
+      ordered.unshift(activeProject);
+    }
+  }
+
+  const listLines = ordered
+    .map((p) => `  ${p}${p === activeProject ? " ◀ active" : ""}`)
+    .join("\n");
+
+  const buttonCells = ordered
+    .filter((p) => !isUnsafeButtonName(p))
+    .map((p) =>
+      p === activeProject
+        ? `{✅ ${p} (active)|/project ${p}}`
+        : `{📁 ${p}|/project ${p}}`,
+    )
+    .join("\n");
+  const buttonBlock =
+    buttonCells.length > 0
+      ? "\n\n```telegram_button\n" + buttonCells + "\n```"
+      : "";
+
+  const current = activeProject ? `Active: ${activeProject}` : "No project active";
+
+  return (
+    `[project-switcher] The user ran /project via Telegram and expects the project list in the chat.\n` +
+    `Authoritative list (do not re-derive, do not add or remove entries):\n` +
+    `${current}\n\n${listLines}\n\n` +
+    `Reply in the chat with exactly this list (keep the active marker) followed by the button block below, ` +
+    `copied verbatim. Do not run any command, do not switch projects yourself, and add nothing else.${buttonBlock}`
+  );
+}
+
+
 function getConfig(): Config {
   if (!config) {
     config = loadConfig();
@@ -209,9 +295,30 @@ function isSafeProjectName(name: string): boolean {
   return true;
 }
 
+/**
+ * Plain text project list via the local UI notification channel —
+ * the unchanged default output for non-Telegram surfaces.
+ */
+function notifyPlainProjectList(ctx: any, projects: string[]): void {
+  const current = activeProject ? `Active: ${activeProject}` : "No project active";
+  const lines = projects.map((p) => {
+    const branch = getGitBranch(projectPath(p));
+    const branchStr = branch ? ` [${branch}]` : "";
+    const marker = p === activeProject ? " ◀ active" : "";
+    return `  ${p}${branchStr}${marker}`;
+  });
+  ctx.ui.notify(
+    `${current}\n\nProjects under ${getConfig().baseDir}:\n${lines.join("\n")}`,
+    "info"
+  );
+}
+
 export default function (pi: ExtensionAPI) {
   // ── Restore state on session start ──────────────────────────────────────
   pi.on("session_start", async (_event, ctx) => {
+    // Session switches reset any pending Telegram status flag
+    clearTelegramStatusFlag();
+
     for (const entry of ctx.sessionManager.getEntries()) {
       if (
         entry.type === "custom" &&
@@ -244,6 +351,28 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
+  // ── Telegram origin detection (input event) ────────────────────────────────
+  //
+  // Prompts dispatched from the pi-telegram queue arrive with source
+  // "extension" and a `[telegram]`-tagged first line, BEFORE the command
+  // bridge re-dispatches the bare command line. Recognizing the raw
+  // dispatch here is the only reliable origin signal; the re-dispatched
+  // text is indistinguishable from a native TUI invocation.
+  //
+  // Requires this extension to be listed BEFORE the command bridge in the
+  // package order (the bridge's "handled" result would short-circuit the
+  // input chain before this handler runs otherwise). Wrong order degrades
+  // gracefully: the flag is never armed and the status falls back to the
+  // plain list.
+  pi.on("input", async (event) => {
+    if (event.source !== "extension") return;
+    const firstLine = event.text.split("\n", 1)[0];
+    if (TELEGRAM_STATUS_RE.test(firstLine.trim())) {
+      armTelegramStatusFlag();
+    }
+    // Never transform or handle: the command bridge owns the re-dispatch.
+  });
+
   // ── Inject project context into every agent turn ─────────────────────────
   pi.on("before_agent_start", async (event, _ctx) => {
     if (!activeProject || !isValidProject(activeProject)) {
@@ -261,6 +390,140 @@ export default function (pi: ExtensionAPI) {
         `All file operations and bash commands should default to this project path unless specified otherwise.`,
     };
   });
+
+  // ── Shared switch flow ──────────────────────────────────────────────────
+  //
+  // Single implementation of /project <name> semantics, used by the typed
+  // argument path and the TUI selection dialog. `createOptIn` (trailing
+  // "!") only applies to the typed path; dialog users confirm interactively.
+  const switchToProject = async (rawName: string, ctx: any, createOptIn: boolean): Promise<void> => {
+    const name = rawName;
+
+    if (!isValidProject(name)) {
+      // Offer to create the folder and switch to it (never silently)
+      if (isSafeProjectName(name)) {
+        let create = false;
+        if (createOptIn) {
+          create = true;
+        } else if (ctx.hasUI) {
+          try {
+            create = await ctx.ui.confirm(
+              "Create project?",
+              `Project "${name}" does not exist. Create ${join(getConfig().baseDir, name)} and switch to it?`
+            );
+          } catch {
+            create = false;
+          }
+        }
+
+        if (create) {
+          const newPath = projectPath(name);
+          try {
+            mkdirSync(newPath, { recursive: false });
+            ctx.ui.notify(`Created project folder: ${newPath}`, "info");
+          } catch (err: any) {
+            ctx.ui.notify(
+              `Failed to create project folder ${newPath}: ${err?.message ?? err}`,
+              "error"
+            );
+            return;
+          }
+          // fall through: the folder now exists and the switch proceeds below
+        }
+      }
+
+      if (!isValidProject(name)) {
+        const available = discoverProjects(getConfig().baseDir).join(", ");
+        ctx.ui.notify(
+          `Unknown project: "${name}".\nAvailable: ${available || "(none)"}`,
+          "warning"
+        );
+        return;
+      }
+    }
+
+    if (name === activeProject) {
+      ctx.ui.notify(`Already on project: ${name}`, "info");
+      return;
+    }
+
+    const previous = activeProject;
+
+    // Remember the current session under the PREVIOUS project before switching
+    const currentSessionFile = ctx.sessionManager.getSessionFile();
+    if (previous && currentSessionFile) {
+      rememberSessionFile(previous, currentSessionFile);
+    }
+
+    // Try to restore the target project's last session
+    const targetSession = getMappedSessionFile(name);
+
+    if (targetSession) {
+      // Persist the switch in the OLD session before replacing it
+      pi.appendEntry(ENTRY_TYPE, { project: name, switchedAt: new Date().toISOString() });
+
+      const result = await ctx.switchSession(targetSession);
+      if (result.cancelled) {
+        // User cancelled; roll back in-memory state
+        activeProject = previous;
+        ctx.ui.notify(`Switch cancelled. Staying on ${previous ?? "no project"}.`, "info");
+        return;
+      }
+
+      // switchSession fires a new session_start, which restores state from
+      // the target session's entries (or auto-detects). Set it explicitly as
+      // a safety net in case the session has no project entry yet.
+      activeProject = name;
+      pi.setSessionName(name);
+      rememberSessionFile(name, targetSession);
+
+      const path = projectPath(name);
+      const branch = getGitBranch(path);
+      const branchStr = branch ? ` on branch \`${branch}\`` : "";
+      ctx.ui.notify(
+        `Switched to ${name} — session restored: ${basename(targetSession)}\n` +
+        `Workdir: ${path}${branchStr ? ` ${branchStr}` : ""}`,
+        "info"
+      );
+      return;
+    }
+
+    // ── Fallback: no stored session (or file gone) -> same-session switch ─
+    activeProject = name;
+
+    // Persist to session
+    pi.appendEntry(ENTRY_TYPE, { project: name, switchedAt: new Date().toISOString() });
+
+    // Update session name
+    pi.setSessionName(name);
+
+    const path = projectPath(name);
+    const branch = getGitBranch(path);
+    const branchStr = branch ? ` on branch \`${branch}\`` : "";
+    const fromStr = previous ? ` (was: ${previous})` : "";
+
+    // Current session identity — still valid on this path (no session replacement)
+    const currentFile = currentSessionFile ?? ctx.sessionManager.getSessionFile();
+    const sessionLine = currentFile
+      ? `Continuing session: ${basename(currentFile)}`
+      : "Continuing current session";
+
+    ctx.ui.notify(
+      `Switched to ${name}${fromStr} — first session in this project\n` +
+      `Workdir: ${path}${branchStr ? ` ${branchStr}` : ""}\n` +
+      sessionLine,
+      "info"
+    );
+
+    // Announce to the agent so it operates in the new context
+    await ctx.waitForIdle();
+    pi.sendUserMessage(
+      `[Project switched to **${name}**]\n` +
+        `Working directory: \`${path}\`${branchStr}\n` +
+        `Please keep all file operations within this project from now on.`,
+      { deliverAs: "followUp" }
+    );
+  };
 
   // ── /project command ─────────────────────────────────────────────────────
   pi.registerCommand("project", {
@@ -283,7 +546,7 @@ export default function (pi: ExtensionAPI) {
         name = name.slice(0, -1).trim();
       }
 
-      // ── No arg: show status ──────────────────────────────────────────────
+      // ── No arg: surface-adaptive status ──────────────────────────────────
       if (!name) {
         const projects = discoverProjects(getConfig().baseDir);
         if (projects.length === 0) {
@@ -293,142 +556,41 @@ export default function (pi: ExtensionAPI) {
           );
           return;
         }
-        const current = activeProject ? `Active: ${activeProject}` : "No project active";
-        const lines = projects.map((p) => {
-          const branch = getGitBranch(projectPath(p));
-          const branchStr = branch ? ` [${branch}]` : "";
-          const marker = p === activeProject ? " ◀ active" : "";
-          return `  ${p}${branchStr}${marker}`;
-        });
-        ctx.ui.notify(`${current}\n\nProjects under ${getConfig().baseDir}:\n${lines.join("\n")}`, "info");
+
+        const isTelegramOrigin = consumeTelegramStatusFlag();
+
+        if (isTelegramOrigin) {
+          // Plain list for the local surface (parity with today) …
+          notifyPlainProjectList(ctx, projects);
+          // … then a follow-up turn whose reply reaches the Telegram chat,
+          // with one button per project. The turn also settles the command
+          // bridge's pending dispatch (its agent_start hook clears the
+          // pending settle entry first).
+          await ctx.waitForIdle();
+          pi.sendUserMessage(buildTelegramStatusPrompt(projects), {
+            deliverAs: "followUp",
+          });
+          return;
+        }
+
+        if (ctx.mode === "tui") {
+          // Selection dialog; dismissing falls back to the plain list.
+          const choice = await ctx.ui.select("Switch project", projects);
+          if (choice !== undefined) {
+            await switchToProject(choice, ctx, false);
+            return;
+          }
+          notifyPlainProjectList(ctx, projects);
+          return;
+        }
+
+        // rpc/json/print and any other surface: unchanged plain list
+        notifyPlainProjectList(ctx, projects);
         return;
       }
 
       // ── Switch project ────────────────────────────────────────────────────
-      if (!isValidProject(name)) {
-        // Offer to create the folder and switch to it (never silently)
-        if (isSafeProjectName(name)) {
-          let create = false;
-          if (createOptIn) {
-            create = true;
-          } else if (ctx.hasUI) {
-            try {
-              create = await ctx.ui.confirm(
-                "Create project?",
-                `Project "${name}" does not exist. Create ${join(getConfig().baseDir, name)} and switch to it?`
-              );
-            } catch {
-              create = false;
-            }
-          }
-
-          if (create) {
-            const newPath = projectPath(name);
-            try {
-              mkdirSync(newPath, { recursive: false });
-              ctx.ui.notify(`Created project folder: ${newPath}`, "info");
-            } catch (err: any) {
-              ctx.ui.notify(
-                `Failed to create project folder ${newPath}: ${err?.message ?? err}`,
-                "error"
-              );
-              return;
-            }
-            // fall through: the folder now exists and the switch proceeds below
-          }
-        }
-
-        if (!isValidProject(name)) {
-          const available = discoverProjects(getConfig().baseDir).join(", ");
-          ctx.ui.notify(
-            `Unknown project: "${name}".\nAvailable: ${available || "(none)"}`,
-            "warning"
-          );
-          return;
-        }
-      }
-
-      if (name === activeProject) {
-        ctx.ui.notify(`Already on project: ${name}`, "info");
-        return;
-      }
-
-      const previous = activeProject;
-
-      // Remember the current session under the PREVIOUS project before switching
-      const currentSessionFile = ctx.sessionManager.getSessionFile();
-      if (previous && currentSessionFile) {
-        rememberSessionFile(previous, currentSessionFile);
-      }
-
-      // Try to restore the target project's last session
-      const targetSession = getMappedSessionFile(name);
-
-      if (targetSession) {
-        // Persist the switch in the OLD session before replacing it
-        pi.appendEntry(ENTRY_TYPE, { project: name, switchedAt: new Date().toISOString() });
-
-        const result = await ctx.switchSession(targetSession);
-        if (result.cancelled) {
-          // User cancelled; roll back in-memory state
-          activeProject = previous;
-          ctx.ui.notify(`Switch cancelled. Staying on ${previous ?? "no project"}.`, "info");
-          return;
-        }
-
-        // switchSession fires a new session_start, which restores state from
-        // the target session's entries (or auto-detects). Set it explicitly as
-        // a safety net in case the session has no project entry yet.
-        activeProject = name;
-        pi.setSessionName(name);
-        rememberSessionFile(name, targetSession);
-
-        const path = projectPath(name);
-        const branch = getGitBranch(path);
-        const branchStr = branch ? ` on branch \`${branch}\`` : "";
-        ctx.ui.notify(
-          `Switched to ${name} — session restored: ${basename(targetSession)}\n` +
-          `Workdir: ${path}${branchStr ? ` ${branchStr}` : ""}`,
-          "info"
-        );
-        return;
-      }
-
-      // ── Fallback: no stored session (or file gone) -> same-session switch ─
-      activeProject = name;
-
-      // Persist to session
-      pi.appendEntry(ENTRY_TYPE, { project: name, switchedAt: new Date().toISOString() });
-
-      // Update session name
-      pi.setSessionName(name);
-
-      const path = projectPath(name);
-      const branch = getGitBranch(path);
-      const branchStr = branch ? ` on branch \`${branch}\`` : "";
-      const fromStr = previous ? ` (was: ${previous})` : "";
-
-      // Current session identity — still valid on this path (no session replacement)
-      const currentFile = currentSessionFile ?? ctx.sessionManager.getSessionFile();
-      const sessionLine = currentFile
-        ? `Continuing session: ${basename(currentFile)}`
-        : "Continuing current session";
-
-      ctx.ui.notify(
-        `Switched to ${name}${fromStr} — first session in this project\n` +
-        `Workdir: ${path}${branchStr ? ` ${branchStr}` : ""}\n` +
-        sessionLine,
-        "info"
-      );
-
-      // Announce to the agent so it operates in the new context
-      await ctx.waitForIdle();
-      pi.sendUserMessage(
-        `[Project switched to **${name}**]\n` +
-          `Working directory: \`${path}\`${branchStr}\n` +
-          `Please keep all file operations within this project from now on.`,
-        { deliverAs: "followUp" }
-      );
+      await switchToProject(name, ctx, createOptIn);
     },
   });
 }

@@ -4,7 +4,11 @@ A [pi coding agent](https://github.com/earendil-works/pi) extension to switch be
 
 ## What it does
 
-- **`/project`** — list all projects (direct subdirectories of the base dir) with git branch info, mark the active one
+- **`/project`** — list all projects (direct subdirectories of the base dir) with git branch info, mark the active one. The output adapts to the surface:
+  - **native TUI**: a selection dialog; picking a project switches to it (dismissing shows the plain list)
+  - **Telegram bridge**: the reply in the chat shows one tappable button per project; clicking a button is exactly like typing `/project <name>`
+  - **other surfaces** (rpc/json/print): plain text list
+  - Note: for the Telegram buttons to work, this extension must be loaded **before** `pi-telegram-command-bridge` (package order in `~/.pi/agent/settings.json`) — the switcher needs to see the raw `[telegram] /project` dispatch before the bridge re-dispatches it.
 - **`/project <name>`** — switch the active project:
   - restores the project's last session if one is stored (see below)
   - persists across reloads (session entry)
@@ -51,7 +55,7 @@ Single-file TypeScript extension (`index.ts`), loaded directly by pi via jiti �
 
 ```bash
 npm install
-npm test        # vitest (17 tests)
+npm test        # vitest (45 tests)
 npm run typecheck
 
 # Run once without installing

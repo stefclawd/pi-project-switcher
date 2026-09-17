@@ -67,6 +67,7 @@ function createFakeCtx(overrides: Record<string, any> = {}) {
     ui: {
       notify: vi.fn(),
       confirm: vi.fn(async () => false),
+      select: vi.fn(async () => undefined),
     },
     switchSession: vi.fn(async (_path: string) => ({ cancelled: false })),
     waitForIdle: vi.fn(async () => {}),
@@ -714,4 +715,342 @@ describe("git branch detection", () => {
       "info"
     );
   }, 15000);
+});
+
+// ── Surface-adaptive status (telegram flag, TUI select, plain list) ────────
+
+describe("telegram status flag: input handler arming", () => {
+  async function armWith(
+    pi: any,
+    handlers: Map<string, Handler>,
+    text: string,
+    source = "extension"
+  ) {
+    await fire("input", handlers, { type: "input", text, source }, createFakeCtx());
+  }
+
+  it("arms on bare [telegram] /project first line", async () => {
+    const { pi, recorded, handlers } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+    expect(handlers.has("input")).toBe(true);
+
+    await armWith(pi, handlers, "[telegram] /project");
+    // armed: a status call in mode "rpc" now takes the telegram path
+    makeProjects(["alpha"]);
+    const ctx = createFakeCtx({ mode: "rpc" });
+    const cmd = recorded.commands.find((c) => c.name === "project")!;
+    await cmd.options.handler("", ctx);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    expect((pi.sendUserMessage as any).mock.calls[0][0]).toContain("telegram_button");
+  });
+
+  it("does not arm for /project with arguments", async () => {
+    makeProjects(["alpha"]);
+    const { pi, recorded, handlers } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    await armWith(pi, handlers, "[telegram] /project alpha");
+    const ctx = createFakeCtx({ mode: "rpc" });
+    const cmd = recorded.commands.find((c) => c.name === "project")!;
+    await cmd.options.handler("", ctx);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("arms for attribute variants like [telegram|thread:x]", async () => {
+    const { pi, recorded, handlers } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    await armWith(pi, handlers, "[telegram|thread:dev] /project");
+    makeProjects(["alpha"]);
+    const ctx = createFakeCtx({ mode: "rpc" });
+    const cmd = recorded.commands.find((c) => c.name === "project")!;
+    await cmd.options.handler("", ctx);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("arms when pi-telegram context sections follow the first line", async () => {
+    const { pi, recorded, handlers } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    await armWith(pi, handlers, "[telegram] /project\n\n[time] 2026-09-17 08:00:00 Europe/Berlin");
+    makeProjects(["alpha"]);
+    const ctx = createFakeCtx({ mode: "rpc" });
+    const cmd = recorded.commands.find((c) => c.name === "project")!;
+    await cmd.options.handler("", ctx);
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not arm for interactive source", async () => {
+    makeProjects(["alpha"]);
+    const { pi, recorded, handlers } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    await armWith(pi, handlers, "[telegram] /project", "interactive");
+    const ctx = createFakeCtx({ mode: "rpc" });
+    const cmd = recorded.commands.find((c) => c.name === "project")!;
+    await cmd.options.handler("", ctx);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("clears the flag on session_start", async () => {
+    const { pi, recorded, handlers } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    await armWith(pi, handlers, "[telegram] /project");
+    await fire("session_start", handlers, { type: "session_start" }, createFakeCtx());
+
+    makeProjects(["alpha"]);
+    const ctx = createFakeCtx({ mode: "rpc" });
+    const cmd = recorded.commands.find((c) => c.name === "project")!;
+    await cmd.options.handler("", ctx);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe("telegram status output", () => {
+  async function runStatusAfterArm(mode = "rpc") {
+    makeProjects(["alpha", "beta"]);
+    const { pi, recorded, handlers } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    await fire(
+      "input",
+      handlers,
+      { type: "input", text: "[telegram] /project", source: "extension" },
+      createFakeCtx()
+    );
+
+    const ctx = createFakeCtx({ mode });
+    const cmd = recorded.commands.find((c) => c.name === "project")!;
+    await cmd.options.handler("", ctx);
+    return { pi, recorded, ctx };
+  }
+
+  it("sends one follow-up with list, button block, and /project prompts", async () => {
+    const { pi, ctx } = await runStatusAfterArm();
+
+    // local surface parity: plain list notify
+    expect(ctx.ui.notify).toHaveBeenCalledTimes(1);
+
+    // exactly one follow-up turn
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    const [content, options] = (pi.sendUserMessage as any).mock.calls[0];
+    expect(options).toEqual({ deliverAs: "followUp" });
+
+    // authoritative list included
+    expect(content).toContain("alpha");
+    expect(content).toContain("beta");
+
+    // pre-rendered button block with one cell per project
+    expect(content).toContain("```telegram_button");
+    expect(content).toContain("{📁 alpha|/project alpha}");
+    expect(content).toContain("{📁 beta|/project beta}");
+  });
+
+  it("marks the active project first with an active-styled button", async () => {
+    makeProjects(["alpha", "beta", "gamma"]);
+    const { pi, recorded, handlers } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    // make beta active via a switch
+    const cmd = recorded.commands.find((c) => c.name === "project")!;
+    await cmd.options.handler("beta", createFakeCtx({ sessionManager: { getEntries: () => [] as any[], getSessionFile: () => undefined } }));
+
+    await fire(
+      "input",
+      handlers,
+      { type: "input", text: "[telegram] /project", source: "extension" },
+      createFakeCtx()
+    );
+    const ctx = createFakeCtx({ mode: "rpc" });
+    await cmd.options.handler("", ctx);
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(2); // switch announce + status
+    const statusContent = (pi.sendUserMessage as any).mock.calls[1][0] as string;
+    const activeIdx = statusContent.indexOf("{✅ beta (active)|/project beta}");
+    const alphaIdx = statusContent.indexOf("{📁 alpha|/project alpha}");
+    expect(activeIdx).toBeGreaterThan(-1);
+    expect(activeIdx).toBeLessThan(alphaIdx);
+    expect(statusContent).toContain("◀ active");
+  });
+
+  it("omits the button cell for unsafe project names", async () => {
+    makeProjects(["alpha", "a{b"]);
+    const { pi, recorded, handlers } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    await fire(
+      "input",
+      handlers,
+      { type: "input", text: "[telegram] /project", source: "extension" },
+      createFakeCtx()
+    );
+    const ctx = createFakeCtx({ mode: "rpc" });
+    const cmd = recorded.commands.find((c) => c.name === "project")!;
+    await cmd.options.handler("", ctx);
+
+    const content = (pi.sendUserMessage as any).mock.calls[0][0] as string;
+    expect(content).toContain("a{b"); // still listed as plain text
+    expect(content).not.toContain("/project a{b"); // but no button prompt for it
+    expect(content).toContain("{📁 alpha|/project alpha}");
+  });
+
+  it("expires the flag after the TTL", async () => {
+    makeProjects(["alpha"]);
+    const { pi, recorded, handlers } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    await fire(
+      "input",
+      handlers,
+      { type: "input", text: "[telegram] /project", source: "extension" },
+      createFakeCtx()
+    );
+
+    // fake timers to push the armed timestamp past the TTL
+    vi.useFakeTimers();
+    vi.advanceTimersByTime(31_000);
+    const ctx = createFakeCtx({ mode: "rpc" });
+    const cmd = recorded.commands.find((c) => c.name === "project")!;
+    await cmd.options.handler("", ctx);
+    vi.useRealTimers();
+
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    expect(ctx.ui.notify).toHaveBeenCalledTimes(1); // plain list fallback
+  });
+
+  it("consumes the flag exactly once", async () => {
+    const { pi, recorded, handlers } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    await fire(
+      "input",
+      handlers,
+      { type: "input", text: "[telegram] /project", source: "extension" },
+      createFakeCtx()
+    );
+
+    makeProjects(["alpha"]);
+    const cmd = recorded.commands.find((c) => c.name === "project")!;
+    await cmd.options.handler("", createFakeCtx({ mode: "rpc" }));
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+
+    // second, native status call: no telegram path anymore
+    await cmd.options.handler("", createFakeCtx({ mode: "rpc" }));
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it("no projects: warning only, no follow-up", async () => {
+    const { pi, recorded, handlers } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    await fire(
+      "input",
+      handlers,
+      { type: "input", text: "[telegram] /project", source: "extension" },
+      createFakeCtx()
+    );
+
+    const ctx = createFakeCtx({ mode: "rpc" });
+    const cmd = recorded.commands.find((c) => c.name === "project")!;
+    await cmd.options.handler("", ctx);
+
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("No projects found"),
+      "warning"
+    );
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+});
+
+describe("TUI status: selection dialog", () => {
+  it("selecting a project runs the shared switch flow", async () => {
+    makeProjects(["alpha", "beta"]);
+    const { pi, recorded } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    const select = vi.fn(async () => "beta");
+    const ctx = createFakeCtx({ mode: "tui" });
+    (ctx.ui as any).select = select;
+
+    const cmd = recorded.commands.find((c) => c.name === "project")!;
+    await cmd.options.handler("", ctx);
+
+    expect(select).toHaveBeenCalledWith("Switch project", ["alpha", "beta"]);
+    expect(recorded.entries).toContainEqual({
+      customType: "project-switcher-state",
+      data: expect.objectContaining({ project: "beta" }),
+    });
+    expect(recorded.sessionNames).toContain("beta");
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("Switched to beta"),
+      "info"
+    );
+  });
+
+  it("dismissing the dialog falls back to the plain list", async () => {
+    makeProjects(["alpha"]);
+    const { pi, recorded } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    const select = vi.fn(async () => undefined);
+    const ctx = createFakeCtx({ mode: "tui" });
+    (ctx.ui as any).select = select;
+
+    const cmd = recorded.commands.find((c) => c.name === "project")!;
+    await cmd.options.handler("", ctx);
+
+    expect(select).toHaveBeenCalled();
+    expect(recorded.entries).toHaveLength(0);
+    expect(recorded.sessionNames).toHaveLength(0);
+    expect(ctx.ui.notify).toHaveBeenCalledTimes(1);
+    const msg = (ctx.ui.notify as any).mock.calls[0][0] as string;
+    expect(msg).toContain("alpha");
+    expect(msg).toContain("Projects under");
+  });
+});
+
+describe("plain status on other surfaces", () => {
+  it("rpc without telegram flag: plain list only", async () => {
+    makeProjects(["alpha"]);
+    const { pi, recorded } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    const ctx = createFakeCtx({ mode: "rpc" });
+    const cmd = recorded.commands.find((c) => c.name === "project")!;
+    await cmd.options.handler("", ctx);
+
+    expect(ctx.ui.notify).toHaveBeenCalledTimes(1);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    expect((ctx.ui as any).select).not.toHaveBeenCalled();
+  });
+
+  it("print mode: plain list only", async () => {
+    makeProjects(["alpha"]);
+    const { pi, recorded } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    const ctx = createFakeCtx({ mode: "print" });
+    const cmd = recorded.commands.find((c) => c.name === "project")!;
+    await cmd.options.handler("", ctx);
+
+    expect(ctx.ui.notify).toHaveBeenCalledTimes(1);
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
 });
