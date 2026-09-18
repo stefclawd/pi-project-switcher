@@ -81,7 +81,18 @@ function makeFakeSession(name: string): string {
   const dir = join(fakeHome, ".pi", "agent", "sessions");
   mkdirSync(dir, { recursive: true });
   const file = join(dir, name);
-  writeFileSync(file, "{}\n", "utf8");
+  // Minimal valid pi session: a session header entry.
+  writeFileSync(
+    file,
+    JSON.stringify({
+      type: "session",
+      version: 3,
+      id: "test-session-id",
+      timestamp: new Date().toISOString(),
+      cwd: process.cwd(),
+    }) + "\n",
+    "utf8"
+  );
   return file;
 }
 
@@ -448,7 +459,7 @@ describe("session map persistence", () => {
     expect(map.alpha.updatedAt).toBeTruthy();
   });
 
-  it("restores the stored session of the target project", async () => {
+  it("restores the stored session of the target project and pre-writes the switch state into it", async () => {
     makeProjects(["alpha", "beta"]);
     const betaSession = makeFakeSession("2026-09-12-beta.jsonl");
 
@@ -469,12 +480,26 @@ describe("session map persistence", () => {
     const ctx = createFakeCtx();
     await cmd.options.handler("beta", ctx);
 
-    expect(ctx.switchSession).toHaveBeenCalledWith(betaSession);
-    expect(ctx.ui.notify).toHaveBeenCalledWith(
+    expect(ctx.switchSession).toHaveBeenCalledWith(betaSession, expect.objectContaining({ withSession: expect.any(Function) }));
+
+    // The switch state was pre-written into the TARGET session file so the
+    // restored runtime activates beta (not a stale project entry).
+    const lines = readFileSync(betaSession, "utf8").trim().split("\n").filter(Boolean);
+    const last = JSON.parse(lines[lines.length - 1]);
+    expect(last.type).toBe("custom");
+    expect(last.customType).toBe("project-switcher-state");
+    expect(last.data.project).toBe("beta");
+
+    // The success notify runs INSIDE withSession against the new session ctx
+    // (old ctx is stale after replacement). Capture and run it.
+    const opts = (ctx.switchSession as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    const newCtx = createFakeCtx();
+    await opts.withSession(newCtx);
+    expect(newCtx.ui.notify).toHaveBeenCalledWith(
       expect.stringContaining("session restored: 2026-09-12-beta.jsonl"),
       "info"
     );
-    const restoreMsg = (ctx.ui.notify as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
+    const restoreMsg = (newCtx.ui.notify as ReturnType<typeof vi.fn>).mock.calls[0][0] as string;
     expect(restoreMsg).toContain(`Workdir: ${join(baseDir, "beta")}`);
   });
 

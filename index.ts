@@ -19,6 +19,7 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { execSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -459,32 +460,68 @@ export default function (pi: ExtensionAPI) {
     const targetSession = getMappedSessionFile(name);
 
     if (targetSession) {
-      // Persist the switch in the OLD session before replacing it
-      pi.appendEntry(ENTRY_TYPE, { project: name, switchedAt: new Date().toISOString() });
+      // Pre-write the switch state INTO THE TARGET session file so the
+      // fresh runtime's session_start restores the right project. Writing
+      // it to the current (old) session instead would leave the target
+      // session's own (stale) project entry authoritative.
+      // SessionManager.open() advances the target file's leaf to this entry.
+      // The same entry must also exist in the old session so a later switch
+      // BACK to the previous project still restores it (the old session is
+      // remembered under the previous project below).
+      try {
+        SessionManager.open(targetSession).appendCustomEntry(ENTRY_TYPE, {
+          project: name,
+          switchedAt: new Date().toISOString(),
+        });
+      } catch (err: any) {
+        ctx.ui.notify(
+          `Could not persist switch state to target session: ${err?.message ?? err}`,
+          "warning"
+        );
+      }
 
-      const result = await ctx.switchSession(targetSession);
+      // Persist the switch in the OLD session too (for switching back later).
+      // Still valid: the old runtime has not been invalidated yet.
+      try {
+        pi.appendEntry(ENTRY_TYPE, { project: name, switchedAt: new Date().toISOString() });
+      } catch {
+        // Non-fatal: the target-session entry above is the authoritative one.
+      }
+
+      // Everything after ctx.switchSession() must run in withSession: the
+      // captured `pi` and command `ctx` are stale once the session is
+      // replaced, and using them throws (previously crashed the command
+      // with "stale ctx" errors and killed the whole flow).
+      const branch = getGitBranch(projectPath(name));
+      const branchStr = branch ? ` on branch \`${branch}\`` : "";
+      const result = await ctx.switchSession(targetSession, {
+        withSession: async (newCtx: any) => {
+          // Safety net in case the restored session has no project entry:
+          // session_start has already run for the new runtime; if it
+          // restored a different project from a stale entry, the pre-written
+          // entry above is the LAST project-switcher-state entry in the file
+          // and therefore authoritative — set the in-memory state explicitly.
+          activeProject = name;
+          newCtx.ui.notify(
+            `Switched to ${name} — session restored: ${basename(targetSession)}\n` +
+            `Workdir: ${projectPath(name)}${branchStr ? ` ${branchStr}` : ""}`,
+            "info"
+          );
+        },
+      });
       if (result.cancelled) {
-        // User cancelled; roll back in-memory state
+        // User cancelled; roll back in-memory state. The pre-written target
+        // entry is harmless: it only records that a switch to `name` was
+        // attempted; an explicit later status/switch overrides it.
         activeProject = previous;
         ctx.ui.notify(`Switch cancelled. Staying on ${previous ?? "no project"}.`, "info");
         return;
       }
 
-      // switchSession fires a new session_start, which restores state from
-      // the target session's entries (or auto-detects). Set it explicitly as
-      // a safety net in case the session has no project entry yet.
-      activeProject = name;
-      pi.setSessionName(name);
+      // Remember the mapping AFTER a successful switch (withSession has
+      // already run). rememberSessionFile only touches the JSON map on
+      // disk, so calling it here is safe.
       rememberSessionFile(name, targetSession);
-
-      const path = projectPath(name);
-      const branch = getGitBranch(path);
-      const branchStr = branch ? ` on branch \`${branch}\`` : "";
-      ctx.ui.notify(
-        `Switched to ${name} — session restored: ${basename(targetSession)}\n` +
-        `Workdir: ${path}${branchStr ? ` ${branchStr}` : ""}`,
-        "info"
-      );
       return;
     }
 
