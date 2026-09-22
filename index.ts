@@ -183,12 +183,23 @@ let config: Config | null = null;
  */
 const TELEGRAM_STATUS_RE = /^\[telegram(?:\|[^\]]*)?\]\s*\/project\s*$/;
 
+/**
+ * Same, but for `/project <name>` (a switch). The command bridge strips
+ * the tag and re-dispatches the bare command line, so a Telegram-originated
+ * switch would otherwise be indistinguishable from a native invocation.
+ * Arguments are captured so the flag matches the command the user sent.
+ */
+const TELEGRAM_SWITCH_RE = /^\[telegram(?:\|[^\]]*)?\]\s*\/project\s+(\S.*)$/;
+
 /** How long an armed flag stays valid (ms). Guards against stale flags
  *  from dispatches that never reached the command handler. */
 const TELEGRAM_FLAG_TTL_MS = 30_000;
 
 /** Armed-at timestamp of a pending Telegram-originated status request, or null. */
 let telegramStatusFlag: number | null = null;
+
+/** Armed-at timestamp of a pending Telegram-originated switch request, or null. */
+let telegramSwitchFlag: number | null = null;
 
 function armTelegramStatusFlag(): void {
   telegramStatusFlag = Date.now();
@@ -202,8 +213,21 @@ function consumeTelegramStatusFlag(): boolean {
   return Date.now() - armed <= TELEGRAM_FLAG_TTL_MS;
 }
 
+function armTelegramSwitchFlag(): void {
+  telegramSwitchFlag = Date.now();
+}
+
+/** Consume the switch flag: returns true (and clears it) when armed and not expired. */
+function consumeTelegramSwitchFlag(): boolean {
+  if (telegramSwitchFlag === null) return false;
+  const armed = telegramSwitchFlag;
+  telegramSwitchFlag = null;
+  return Date.now() - armed <= TELEGRAM_FLAG_TTL_MS;
+}
+
 function clearTelegramStatusFlag(): void {
   telegramStatusFlag = null;
+  telegramSwitchFlag = null;
 }
 
 /**
@@ -256,6 +280,58 @@ function buildTelegramStatusPrompt(projects: string[]): string {
     `${current}\n\n${listLines}\n\n` +
     `Reply in the chat with exactly this list (keep the active marker) followed by the button block below, ` +
     `copied verbatim. Do not run any command, do not switch projects yourself, and add nothing else.${buttonBlock}`
+  );
+}
+
+/**
+ * Build the follow-up prompt for a Telegram-originated project switch. The
+ * turn's reply is delivered to the Telegram chat as the visible confirmation
+ * that the switch succeeded (the local UI notification never reaches the
+ * phone). Facts are passed by the extension; the reply shape is prescribed
+ * so the model cannot invent outcomes. `sendFn` is passed in so both switch
+ * paths reuse this: the restore path must send from the fresh withSession
+ * context (never the stale pre-switch pi), the fallback path from the
+ * current runtime.
+ */
+function buildTelegramSwitchConfirmationPrompt(opts: {
+  project: string;
+  path: string;
+  branchStr: string;
+  sessionLine: string;
+  previous: string | null;
+}): string {
+  const { project, path, branchStr, sessionLine, previous } = opts;
+
+  const confirmLine = `✅ Switched to **${project}**${previous ? ` (was: ${previous})` : ""}`;
+  const infoLines = [confirmLine, `📁 ${path}${branchStr ? ` (${branchStr})` : ""}`, sessionLine].join("\n");
+
+  const cells: string[] = ["{📋 Projects|/project}"];
+  if (previous && !isUnsafeButtonName(previous) && previous !== project) {
+    cells.push(`{↩️ Back to ${previous}|/project ${previous}}`);
+  }
+  const buttonBlock =
+    cells.length > 0
+      ? "\n\n```telegram_button\n" + cells.join("\n") + "\n```"
+      : "";
+
+  return (
+    `[project-switcher] The user ran /project ${project} via Telegram and expects a confirmation that the switch succeeded.\n` +
+    `Authoritative switch facts (do not re-derive, do not run any command, do not switch projects yourself):\n` +
+    `${infoLines}\n\n` +
+    `Reply in the chat with exactly the lines above, followed by the button block below, copied verbatim. ` +
+    `Add nothing else.${buttonBlock}`
+  );
+}
+
+/**
+ * Short follow-up for Telegram-originated switch outcomes that changed
+ * nothing (already-active or cancelled): guarantees the chat still gets a
+ * visible reply instead of silence.
+ */
+function buildTelegramNoChangePrompt(text: string): string {
+  return (
+    `[project-switcher] The user ran /project via Telegram.\n` +
+    `Reply in the chat with exactly this line and nothing else: ${text}`
   );
 }
 
@@ -368,8 +444,11 @@ export default function (pi: ExtensionAPI) {
   pi.on("input", async (event) => {
     if (event.source !== "extension") return;
     const firstLine = event.text.split("\n", 1)[0];
-    if (TELEGRAM_STATUS_RE.test(firstLine.trim())) {
+    const trimmed = firstLine.trim();
+    if (TELEGRAM_STATUS_RE.test(trimmed)) {
       armTelegramStatusFlag();
+    } else if (TELEGRAM_SWITCH_RE.test(trimmed)) {
+      armTelegramSwitchFlag();
     }
     // Never transform or handle: the command bridge owns the re-dispatch.
   });
@@ -399,6 +478,7 @@ export default function (pi: ExtensionAPI) {
   // "!") only applies to the typed path; dialog users confirm interactively.
   const switchToProject = async (rawName: string, ctx: any, createOptIn: boolean): Promise<void> => {
     const name = rawName;
+    const isTelegramOrigin = consumeTelegramSwitchFlag();
 
     if (!isValidProject(name)) {
       // Offer to create the folder and switch to it (never silently)
@@ -439,12 +519,25 @@ export default function (pi: ExtensionAPI) {
           `Unknown project: "${name}".\nAvailable: ${available || "(none)"}`,
           "warning"
         );
+        if (isTelegramOrigin) {
+          await ctx.waitForIdle();
+          pi.sendUserMessage(
+            buildTelegramNoChangePrompt(`⚠️ Unknown project: ${name} — no switch performed.`),
+            { deliverAs: "followUp" }
+          );
+        }
         return;
       }
     }
 
     if (name === activeProject) {
       ctx.ui.notify(`Already on project: ${name}`, "info");
+      if (isTelegramOrigin) {
+        await ctx.waitForIdle();
+        pi.sendUserMessage(buildTelegramNoChangePrompt(`ℹ️ Already on project: **${name}**`), {
+          deliverAs: "followUp",
+        });
+      }
       return;
     }
 
@@ -507,6 +600,23 @@ export default function (pi: ExtensionAPI) {
             `Workdir: ${projectPath(name)}${branchStr ? ` ${branchStr}` : ""}`,
             "info"
           );
+          if (isTelegramOrigin) {
+            // Confirmation turn from the FRESH runtime: the reply reaches
+            // the Telegram chat (the local notify above never does). Only
+            // the new context is touched — the pre-switch pi/ctx are stale.
+            // The turn also settles pi-telegram's dispatch queue.
+            await newCtx.waitForIdle();
+            await newCtx.sendUserMessage(
+              buildTelegramSwitchConfirmationPrompt({
+                project: name,
+                path: projectPath(name),
+                branchStr,
+                sessionLine: `🗂 Session restored: ${basename(targetSession)}`,
+                previous,
+              }),
+              { deliverAs: "followUp" }
+            );
+          }
         },
       });
       if (result.cancelled) {
@@ -515,6 +625,15 @@ export default function (pi: ExtensionAPI) {
         // attempted; an explicit later status/switch overrides it.
         activeProject = previous;
         ctx.ui.notify(`Switch cancelled. Staying on ${previous ?? "no project"}.`, "info");
+        if (isTelegramOrigin) {
+          await ctx.waitForIdle();
+          pi.sendUserMessage(
+            buildTelegramNoChangePrompt(
+              `⚠️ Switch to ${name} cancelled — staying on ${previous ?? "no project"}.`
+            ),
+            { deliverAs: "followUp" }
+          );
+        }
         return;
       }
 
@@ -552,12 +671,22 @@ export default function (pi: ExtensionAPI) {
       "info"
     );
 
-    // Announce to the agent so it operates in the new context
+    // Announce to the agent so it operates in the new context — or, for a
+    // Telegram-originated switch, send the chat-visible confirmation turn
+    // (it doubles as the agent context announcement).
     await ctx.waitForIdle();
     pi.sendUserMessage(
-      `[Project switched to **${name}**]\n` +
-        `Working directory: \`${path}\`${branchStr}\n` +
-        `Please keep all file operations within this project from now on.`,
+      isTelegramOrigin
+        ? buildTelegramSwitchConfirmationPrompt({
+            project: name,
+            path,
+            branchStr,
+            sessionLine: `🗂 First session in this project (${sessionLine})`,
+            previous,
+          })
+        : `[Project switched to **${name}**]\n` +
+          `Working directory: \`${path}\`${branchStr}\n` +
+          `Please keep all file operations within this project from now on.`,
       { deliverAs: "followUp" }
     );
   };

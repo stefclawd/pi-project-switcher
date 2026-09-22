@@ -14,6 +14,7 @@ A [pi coding agent](https://github.com/earendil-works/pi) extension to switch be
   - persists across reloads (session entry)
   - sets the session display name
   - injects the project path into every agent turn's system prompt, so file operations default to the active project
+  - **via the Telegram bridge**: the switch is confirmed in the chat — a short reply with the project, working directory, and session identity, plus buttons (project list, and switch back to the previous project). The confirmation is sent from the new session runtime, so it also works when the switch restores a stored session. No-switch outcomes (already active, cancelled, unknown) are answered in the chat too.
   - **if the project doesn't exist yet**, offers to create the folder and switch to it (confirmation dialog on dialog-capable surfaces; use `/project <name>!` to skip the dialog — e.g. on headless/RPC surfaces). Unsafe names (path segments, `..`, hidden, absolute) are never created.
 - **Session restore** — a machine-local map (`~/.pi/agent/project-switcher-sessions.json`) remembers the most recent session per project. Switching projects returns you to that project's last session; if none exists (or the file is gone), the switch happens in the current session.
 - **Auto-detection** — if pi starts inside `~/dev/<project>`, that project is active automatically

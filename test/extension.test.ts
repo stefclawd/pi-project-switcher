@@ -1079,3 +1079,290 @@ describe("plain status on other surfaces", () => {
     expect(pi.sendUserMessage).not.toHaveBeenCalled();
   });
 });
+
+describe("telegram switch confirmation", () => {
+  /** Arm the switch flag exactly the way the raw bridge dispatch does. */
+  async function armSwitchFlag(
+    handlers: Map<string, Handler>,
+    text = "[telegram] /project beta"
+  ) {
+    await fire(
+      "input",
+      handlers,
+      { type: "input", text, source: "extension" },
+      createFakeCtx()
+    );
+  }
+
+  it("arms the switch flag for [telegram] /project <name> (plain, attribute variant, context sections)", async () => {
+    for (const text of [
+      "[telegram] /project beta",
+      "[telegram|thread:dev] /project beta",
+      "[telegram] /project beta!\n\n[time] 2026-09-22 20:00:00 Europe/Berlin",
+    ]) {
+      makeProjects(["alpha", "beta"]);
+      const { pi, recorded, handlers } = createFakePi();
+      const { default: factory } = await loadExtension();
+      factory(pi);
+
+      await armSwitchFlag(handlers, text);
+      const cmd = recorded.commands.find((c) => c.name === "project")!;
+      await cmd.options.handler("beta", createFakeCtx());
+
+      // confirmation turn went out on the same-session fallback path
+      expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+      const content = (pi.sendUserMessage as any).mock.calls[0][0] as string;
+      expect(content).toContain("Switched to **beta**");
+      rmSync(join(baseDir, "alpha"), { recursive: true });
+      rmSync(join(baseDir, "beta"), { recursive: true });
+    }
+  });
+
+  it("restore path: confirmation follow-up is sent from the fresh withSession context", async () => {
+    makeProjects(["alpha", "beta"]);
+    const betaSession = makeFakeSession("2026-09-22-beta.jsonl");
+    writeFileSync(
+      sessionMapPath,
+      JSON.stringify({ beta: { sessionFile: "2026-09-22-beta.jsonl", updatedAt: "x" } }),
+      "utf8"
+    );
+
+    const { pi, recorded, handlers } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    await armSwitchFlag(handlers);
+    const cmd = recorded.commands.find((c) => c.name === "project")!;
+    const ctx = createFakeCtx();
+    await cmd.options.handler("beta", ctx);
+
+    expect(ctx.switchSession).toHaveBeenCalledWith(
+      betaSession,
+      expect.objectContaining({ withSession: expect.any(Function) })
+    );
+
+    // the OLD runtime must not be used after the switch: no stale pi follow-up
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+
+    // run the withSession callback against a fresh context (as pi would)
+    const opts = (ctx.switchSession as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    const newCtx = createFakeCtx();
+    newCtx.sendUserMessage = vi.fn(async () => {});
+    await opts.withSession(newCtx);
+
+    expect(newCtx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("session restored: 2026-09-22-beta.jsonl"),
+      "info"
+    );
+    expect(newCtx.sendUserMessage).toHaveBeenCalledTimes(1);
+    const [content, options] = (newCtx.sendUserMessage as any).mock.calls[0];
+    expect(options).toEqual({ deliverAs: "followUp" });
+    expect(content).toContain("Switched to **beta**");
+    expect(content).toContain(join(baseDir, "beta"));
+    expect(content).toContain("2026-09-22-beta.jsonl");
+    // button row: status button, no switch-back (no previous project)
+    expect(content).toContain("{📋 Projects|/project}");
+  });
+
+  it("restore path with previous project: confirmation includes a switch-back button", async () => {
+    makeProjects(["alpha", "beta"]);
+    const alphaSession = makeFakeSession("alpha.jsonl");
+    const betaSession = makeFakeSession("beta.jsonl");
+    writeFileSync(
+      sessionMapPath,
+      JSON.stringify({
+        alpha: { sessionFile: "alpha.jsonl", updatedAt: "x" },
+        beta: { sessionFile: "beta.jsonl", updatedAt: "x" },
+      }),
+      "utf8"
+    );
+
+    const { pi, recorded, handlers } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    // start on alpha
+    const startCtx = createFakeCtx({
+      sessionManager: {
+        getEntries: () => [] as any[],
+        getSessionFile: () => alphaSession,
+      },
+      cwd: join(baseDir, "alpha"),
+    });
+    await fire("session_start", handlers, { type: "session_start" }, startCtx);
+
+    await armSwitchFlag(handlers);
+    const cmd = recorded.commands.find((c) => c.name === "project")!;
+    const ctx = createFakeCtx({
+      sessionManager: {
+        getEntries: () => [] as any[],
+        getSessionFile: () => alphaSession,
+      },
+    });
+    await cmd.options.handler("beta", ctx);
+
+    const opts = (ctx.switchSession as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    const newCtx = createFakeCtx();
+    newCtx.sendUserMessage = vi.fn(async () => {});
+    await opts.withSession(newCtx);
+
+    const content = (newCtx.sendUserMessage as any).mock.calls[0][0] as string;
+    expect(content).toContain("(was: alpha)");
+    expect(content).toContain("{↩️ Back to alpha|/project alpha}");
+    expect(content).toContain("{📋 Projects|/project}");
+  });
+
+  it("fallback path: confirmation replaces the generic announcement", async () => {
+    makeProjects(["alpha", "beta"]);
+    const { pi, recorded, handlers } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    await armSwitchFlag(handlers);
+    const cmd = recorded.commands.find((c) => c.name === "project")!;
+    const ctx = createFakeCtx();
+    await cmd.options.handler("beta", ctx);
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    const [content, options] = (pi.sendUserMessage as any).mock.calls[0];
+    expect(options).toEqual({ deliverAs: "followUp" });
+    expect(content).toContain("Switched to **beta**");
+    expect(content).toContain(join(baseDir, "beta"));
+    expect(content).toContain("First session in this project");
+    // generic announcement text must NOT be sent on the telegram path
+    expect(content).not.toContain("[Project switched to");
+  });
+
+  it("native switch without flag: unchanged behavior, no confirmation turn", async () => {
+    makeProjects(["alpha", "beta"]);
+    const { pi, recorded } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    const cmd = recorded.commands.find((c) => c.name === "project")!;
+    const ctx = createFakeCtx();
+    await cmd.options.handler("beta", ctx);
+
+    expect(pi.sendUserMessage).toHaveBeenCalledTimes(1);
+    const content = (pi.sendUserMessage as any).mock.calls[0][0] as string;
+    expect(content).toContain("[Project switched to **beta**]");
+    expect(content).not.toContain("telegram_button");
+  });
+
+  it("already-active switch via telegram sends a short follow-up", async () => {
+    makeProjects(["alpha"]);
+    const { pi, recorded, handlers } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    const cmd = recorded.commands.find((c) => c.name === "project")!;
+    await cmd.options.handler("alpha", createFakeCtx()); // make alpha active
+
+    await armSwitchFlag(handlers, "[telegram] /project alpha");
+    const ctx = createFakeCtx();
+    await cmd.options.handler("alpha", ctx);
+
+    expect(ctx.ui.notify).toHaveBeenCalledWith("Already on project: alpha", "info");
+    const calls = (pi.sendUserMessage as any).mock.calls;
+    const last = calls[calls.length - 1];
+    expect(last[0]).toContain("Already on project: **alpha**");
+    expect(last[1]).toEqual({ deliverAs: "followUp" });
+  });
+
+  it("unknown project via telegram answers the chat and does not consume a switch twice", async () => {
+    makeProjects(["alpha"]);
+    const { pi, recorded, handlers } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    await armSwitchFlag(handlers, "[telegram] /project missing");
+    const cmd = recorded.commands.find((c) => c.name === "project")!;
+    const ctx = createFakeCtx();
+    await cmd.options.handler("missing", ctx);
+
+    const calls = (pi.sendUserMessage as any).mock.calls;
+    const last = calls[calls.length - 1];
+    expect(last[0]).toContain("Unknown project: missing");
+  });
+
+  it("cancelled switch via telegram informs the chat and rolls back", async () => {
+    makeProjects(["alpha", "beta"]);
+    makeFakeSession("beta-session.jsonl");
+    writeFileSync(
+      sessionMapPath,
+      JSON.stringify({ beta: { sessionFile: "beta-session.jsonl", updatedAt: "x" } }),
+      "utf8"
+    );
+
+    const { pi, recorded, handlers } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    // start on alpha
+    const startCtx = createFakeCtx({ cwd: join(baseDir, "alpha") });
+    await fire("session_start", handlers, { type: "session_start" }, startCtx);
+
+    await armSwitchFlag(handlers);
+    const cmd = recorded.commands.find((c) => c.name === "project")!;
+    const ctx = createFakeCtx({
+      switchSession: vi.fn(async () => ({ cancelled: true })),
+    });
+    await cmd.options.handler("beta", ctx);
+
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("Switch cancelled"),
+      "info"
+    );
+    const calls = (pi.sendUserMessage as any).mock.calls;
+    const last = calls[calls.length - 1];
+    expect(last[0]).toContain("cancelled");
+    expect(last[0]).toContain("alpha");
+  });
+
+  it("switch flag expires after the TTL and is cleared on session_start", async () => {
+    makeProjects(["alpha", "beta"]);
+    const { pi, recorded, handlers } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    await armSwitchFlag(handlers);
+
+    // expire: push past the TTL
+    vi.useFakeTimers();
+    vi.advanceTimersByTime(31_000);
+    const cmd = recorded.commands.find((c) => c.name === "project")!;
+    await cmd.options.handler("beta", createFakeCtx());
+    vi.useRealTimers();
+    // generic announcement only — no telegram confirmation
+    expect((pi.sendUserMessage as any).mock.calls[0][0]).toContain("[Project switched to");
+    expect((pi.sendUserMessage as any).mock.calls[0][0]).not.toContain("telegram_button");
+
+    // cleared on session_start
+    await armSwitchFlag(handlers);
+    await fire("session_start", handlers, { type: "session_start" }, createFakeCtx());
+    await cmd.options.handler("beta", createFakeCtx());
+    const calls = (pi.sendUserMessage as any).mock.calls;
+    const last = calls[calls.length - 1];
+    expect(last[0]).toContain("[Project switched to");
+  });
+
+  it("status and switch flags are independent", async () => {
+    makeProjects(["alpha", "beta"]);
+    const { pi, recorded, handlers } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    // arm the STATUS flag, then run a switch: switch must not consume it
+    await armSwitchFlag(handlers, "[telegram] /project");
+    const cmd = recorded.commands.find((c) => c.name === "project")!;
+    await cmd.options.handler("beta", createFakeCtx());
+    expect((pi.sendUserMessage as any).mock.calls[0][0]).toContain("[Project switched to");
+
+    // the status flag survives: a status call still takes the telegram path
+    const statusCtx = createFakeCtx({ mode: "rpc" });
+    await cmd.options.handler("", statusCtx);
+    const statusContent = (pi.sendUserMessage as any).mock.calls[1][0] as string;
+    expect(statusContent).toContain("telegram_button");
+    expect(statusContent).toContain("{📁 alpha|/project alpha}");
+  });
+});
