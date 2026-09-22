@@ -356,13 +356,39 @@ function telegramOwnersPath(): string {
 const TELEGRAM_OWNERSHIP_FRESH_MS = 10_000;
 
 /**
- * Delay before re-dispatching /telegram-connect after a session-replacing
- * switch. Must exceed pi-telegram's lock staleness window (8s): the
- * suspended old runtime stops refreshing the heartbeat at session
- * shutdown, and a *stale* lock is the only one the connect handler's
- * non-forced acquire can replace across a cwd mismatch.
+ * Delay before re-dispatching /telegram-connect in the new runtime. The
+ * pre-switch /telegram-disconnect already released the lock synchronously,
+ * so the connect succeeds unconditionally; the short delay only avoids
+ * racing the session-replacement lifecycle observers.
  */
-const TELEGRAM_REARM_DELAY_MS = 9_000;
+const TELEGRAM_REARM_DELAY_MS = 3_000;
+
+/**
+ * Release the Telegram transport from the OLD (owning) runtime, before
+ * the session is replaced. pi's prompt() executes extension commands
+ * synchronously, so when this returns, pi-telegram has stopped polling and
+ * released the lock (deleted the owners.json entry). Only the owning
+ * runtime can release (release() is ownership-guarded), which is exactly
+ * why this must run before ctx.switchSession() — and why the probe must
+ * pass first. Threaded Mode is disabled for this bot, so no confirmation
+ * dialog is raised in the headless daemon.
+ */
+async function releaseTelegramTransportBeforeSwitch(pi: any, source: string): Promise<boolean> {
+  try {
+    await pi.sendUserMessage("/telegram-disconnect", {
+      expandPromptTemplates: true,
+    });
+    return true;
+  } catch (err: any) {
+    try {
+      pi.notify?.(`Telegram release before ${source} switch failed: ${err?.message ?? err}`, "warning");
+    } catch {
+      // Non-fatal: the switch proceeds; a later manual /telegram-connect
+      // still works because we never mutated anything.
+    }
+    return false;
+  }
+}
 
 /**
  * Read-only probe: is the session we are about to leave the live owner of
@@ -412,8 +438,10 @@ function scheduleTelegramRearm(newCtx: any, source: string): void {
     pendingRearmTimer = null;
     try {
       // Command re-dispatch from the FRESH runtime: executes pi-telegram's
-      // connect handler (no agent turn) and re-acquires the now-stale lock,
-      // restarting polling in the new session.
+      // connect handler (no agent turn). The lock was released by the
+      // pre-switch disconnect, so the acquire succeeds unconditionally —
+      // no staleness wait, no takeover dialog (same-pid locks never go
+      // stale, and same-process takeover cannot cross a cwd mismatch).
       await newCtx.sendUserMessage("/telegram-connect", {
         expandPromptTemplates: true,
       });
@@ -686,13 +714,23 @@ export default function (pi: ExtensionAPI) {
       const branchStr = branch ? ` on branch \`${branch}\`` : "";
       // Ownership probe BEFORE the switch (the old session's cwd is only
       // available here): when the session we are leaving is the live owner
-      // of the connected Telegram transport, the new runtime must re-arm
-      // it after the switch (pi-telegram suspends polling on session
-      // shutdown and its auto-start declines the handoff across a cwd
-      // mismatch). The probe failing means we are NOT the owner (another
-      // pi instance, or Telegram was never connected here): re-arm nothing.
+      // of the connected Telegram transport, the transport must be carried
+      // across the replacement: the old runtime releases it now (the only
+      // runtime that CAN — release() is ownership-guarded), and the new
+      // runtime re-arms it in withSession. Without the release, the lock
+      // entry would stay forever active-here (same-pid locks never go
+      // stale) and the connect could never re-acquire across the cwd
+      // change. The probe failing means we are NOT the owner (another pi
+      // instance, or Telegram was never connected here): touch nothing.
       const ownedTelegramTransport =
         isTelegramOrigin && probeTelegramTransportOwnership(ctx.cwd);
+      let releasedTelegramTransport = false;
+      if (ownedTelegramTransport) {
+        // Must run while the old runtime is still current, i.e. before
+        // ctx.switchSession(). Executes /telegram-disconnect synchronously
+        // (pi runs extension commands before any queue/streaming logic).
+        releasedTelegramTransport = await releaseTelegramTransportBeforeSwitch(pi, name);
+      }
       const result = await ctx.switchSession(targetSession, {
         withSession: async (newCtx: any) => {
           // Safety net in case the restored session has no project entry:
@@ -723,11 +761,11 @@ export default function (pi: ExtensionAPI) {
               { deliverAs: "followUp" }
             );
           }
-          if (ownedTelegramTransport) {
-            // Re-arm the Telegram transport from the fresh runtime. Only the
-            // withSession context is touched; the delay lets the old lock
-            // go stale (see TELEGRAM_REARM_DELAY_MS) so the connect
-            // handler's acquire can replace it across the cwd mismatch.
+          if (releasedTelegramTransport) {
+            // Re-arm the Telegram transport from the fresh runtime. The lock
+            // was released by the pre-switch disconnect, so this connect
+            // acquires unconditionally after the short safety delay. Only
+            // the withSession context is touched (see scheduleTelegramRearm).
             scheduleTelegramRearm(newCtx, name);
           }
         },
@@ -738,6 +776,23 @@ export default function (pi: ExtensionAPI) {
         // attempted; an explicit later status/switch overrides it.
         activeProject = previous;
         ctx.ui.notify(`Switch cancelled. Staying on ${previous ?? "no project"}.`, "info");
+        if (releasedTelegramTransport) {
+          // The pre-switch disconnect released the transport for the
+          // replacement that is now NOT happening: reconnect from this
+          // (still-current) runtime so the cancelled switch leaves the
+          // transport in its original state. No lock remains, so the
+          // connect re-acquires unconditionally.
+          try {
+            await pi.sendUserMessage("/telegram-connect", {
+              expandPromptTemplates: true,
+            });
+          } catch (err: any) {
+            ctx.ui.notify(
+              `Telegram reconnect after cancelled switch failed: ${err?.message ?? err}`,
+              "warning"
+            );
+          }
+        }
         if (isTelegramOrigin) {
           await ctx.waitForIdle();
           pi.sendUserMessage(

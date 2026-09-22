@@ -1394,7 +1394,17 @@ describe("telegram transport re-arm after session switch", () => {
     };
   }
 
-  /** Run a restore-path switch after arming the flag; returns the captured withSession ctx. */
+  /** Collect sendUserMessage texts sent via the OLD runtime pi object. */
+  function piSentTexts(pi: any): string[] {
+    return (pi.sendUserMessage as any).mock.calls.map((c: any[]) => c[0] as string);
+  }
+
+  /** Collect sendUserMessage texts sent via a withSession context. */
+  function ctxSentTexts(ctx: any): string[] {
+    return (ctx.sendUserMessage as any).mock.calls.map((c: any[]) => c[0] as string);
+  }
+
+  /** Run a restore-path switch after arming the flag; runs withSession too. */
   async function runRestoreSwitch(handlers: Map<string, Handler>, recorded: any) {
     const betaSession = makeFakeSession("rearm-beta.jsonl");
     writeFileSync(
@@ -1418,7 +1428,7 @@ describe("telegram transport re-arm after session switch", () => {
     return { ctx, newCtx };
   }
 
-  it("re-arms after the delay when the probe passes (fresh same-pid same-cwd lock)", async () => {
+  it("releases before the switch and re-arms after the delay when the probe passes", async () => {
     makeProjects(["alpha", "beta"]);
     writeOwners(freshEntry());
     const { pi, recorded, handlers } = createFakePi();
@@ -1427,85 +1437,97 @@ describe("telegram transport re-arm after session switch", () => {
 
     vi.useFakeTimers();
     try {
-      const { newCtx } = await runRestoreSwitch(handlers, recorded);
+      const { ctx, newCtx } = await runRestoreSwitch(handlers, recorded);
 
-      // not yet: the re-arm waits past pi-telegram's staleness window
-      expect(newCtx.sendUserMessage).toHaveBeenCalledTimes(1); // confirmation turn only
+      // 1. the OLD runtime executed /telegram-disconnect BEFORE switchSession
+      expect(piSentTexts(pi)).toContain("/telegram-disconnect");
+      expect(ctx.switchSession).toHaveBeenCalled();
 
-      await vi.advanceTimersByTimeAsync(9_000);
+      // 2. no reconnect yet (short safety delay)
+      expect(ctxSentTexts(newCtx).filter((t) => t === "/telegram-connect")).toHaveLength(0);
 
-      const calls = (newCtx.sendUserMessage as any).mock.calls;
-      const rearm = calls[calls.length - 1];
-      expect(rearm[0]).toBe("/telegram-connect");
-      expect(rearm[1]).toEqual({ expandPromptTemplates: true });
+      // 3. after the delay the NEW runtime re-dispatches /telegram-connect
+      await vi.advanceTimersByTimeAsync(3_000);
+      const connects = ctxSentTexts(newCtx).filter((t) => t === "/telegram-connect");
+      expect(connects).toHaveLength(1);
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it("does not re-arm when the lock belongs to a different pid", async () => {
+  it("does not release or re-arm when the lock belongs to a different pid", async () => {
     makeProjects(["alpha", "beta"]);
     writeOwners(freshEntry({ pid: process.pid + 1 }));
     const { pi, recorded, handlers } = createFakePi();
     const { default: factory } = await loadExtension();
     factory(pi);
 
-    const { newCtx } = await runRestoreSwitch(handlers, recorded);
     vi.useFakeTimers();
-    vi.advanceTimersByTime(20_000);
-    await Promise.resolve();
-    vi.useRealTimers();
-    expect((newCtx.sendUserMessage as any).mock.calls).toHaveLength(1); // confirmation only
+    try {
+      const { newCtx } = await runRestoreSwitch(handlers, recorded);
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(piSentTexts(pi)).not.toContain("/telegram-disconnect");
+      expect(ctxSentTexts(newCtx)).not.toContain("/telegram-connect");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
-  it("does not re-arm when the heartbeat is stale", async () => {
+  it("does not release or re-arm when the heartbeat is stale", async () => {
     makeProjects(["alpha", "beta"]);
     writeOwners(freshEntry({ heartbeatMs: Date.now() - 60_000 }));
     const { pi, recorded, handlers } = createFakePi();
     const { default: factory } = await loadExtension();
     factory(pi);
 
-    const { newCtx } = await runRestoreSwitch(handlers, recorded);
     vi.useFakeTimers();
-    vi.advanceTimersByTime(20_000);
-    await Promise.resolve();
-    vi.useRealTimers();
-    expect((newCtx.sendUserMessage as any).mock.calls).toHaveLength(1);
+    try {
+      const { newCtx } = await runRestoreSwitch(handlers, recorded);
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(piSentTexts(pi)).not.toContain("/telegram-disconnect");
+      expect(ctxSentTexts(newCtx)).not.toContain("/telegram-connect");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
-  it("does not re-arm when the lock cwd does not match the old session", async () => {
+  it("does not release or re-arm when the lock cwd does not match the old session", async () => {
     makeProjects(["alpha", "beta"]);
     writeOwners(freshEntry({ cwd: "/somewhere/else" }));
     const { pi, recorded, handlers } = createFakePi();
     const { default: factory } = await loadExtension();
     factory(pi);
 
-    const { newCtx } = await runRestoreSwitch(handlers, recorded);
     vi.useFakeTimers();
-    vi.advanceTimersByTime(20_000);
-    await Promise.resolve();
-    vi.useRealTimers();
-    expect((newCtx.sendUserMessage as any).mock.calls).toHaveLength(1);
-  });
-
-  it("does not re-arm when owners.json is missing or malformed", async () => {
-    for (const malformed of [null]) {
-      makeProjects(["alpha", "beta"]);
-      writeOwners(malformed);
-      const { pi, recorded, handlers } = createFakePi();
-      const { default: factory } = await loadExtension();
-      factory(pi);
-
+    try {
       const { newCtx } = await runRestoreSwitch(handlers, recorded);
-      vi.useFakeTimers();
-      vi.advanceTimersByTime(20_000);
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(piSentTexts(pi)).not.toContain("/telegram-disconnect");
+      expect(ctxSentTexts(newCtx)).not.toContain("/telegram-connect");
+    } finally {
       vi.useRealTimers();
-      expect((newCtx.sendUserMessage as any).mock.calls).toHaveLength(1);
     }
   });
 
-  it("re-arms when the lock carries no cwd", async () => {
+  it("does not release or re-arm when owners.json is missing or malformed", async () => {
+    makeProjects(["alpha", "beta"]);
+    writeOwners(null);
+    const { pi, recorded, handlers } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    vi.useFakeTimers();
+    try {
+      const { newCtx } = await runRestoreSwitch(handlers, recorded);
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(piSentTexts(pi)).not.toContain("/telegram-disconnect");
+      expect(ctxSentTexts(newCtx)).not.toContain("/telegram-connect");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("releases and re-arms when the lock carries no cwd", async () => {
     makeProjects(["alpha", "beta"]);
     const entry: Record<string, any> = freshEntry();
     delete entry.cwd;
@@ -1517,15 +1539,15 @@ describe("telegram transport re-arm after session switch", () => {
     vi.useFakeTimers();
     try {
       const { newCtx } = await runRestoreSwitch(handlers, recorded);
-      await vi.advanceTimersByTimeAsync(9_000);
-      const calls = (newCtx.sendUserMessage as any).mock.calls;
-      expect(calls[calls.length - 1][0]).toBe("/telegram-connect");
+      expect(piSentTexts(pi)).toContain("/telegram-disconnect");
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(ctxSentTexts(newCtx)).toContain("/telegram-connect");
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it("native switch never consults the lock or re-arms", async () => {
+  it("native switch never consults the lock, never releases or re-arms", async () => {
     makeProjects(["alpha", "beta"]);
     writeOwners(freshEntry());
     const betaSession = makeFakeSession("native-beta.jsonl");
@@ -1548,15 +1570,14 @@ describe("telegram transport re-arm after session switch", () => {
     await opts.withSession(newCtx);
 
     vi.useFakeTimers();
-    vi.advanceTimersByTime(20_000);
-    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(10_000);
     vi.useRealTimers();
-    // no confirmation turn, no re-arm — native switch is unchanged
-    expect(newCtx.sendUserMessage).not.toHaveBeenCalled();
-    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+    // no release, no confirmation turn, no re-arm — native switch unchanged
+    expect(piSentTexts(pi)).not.toContain("/telegram-disconnect");
+    expect(ctxSentTexts(newCtx)).not.toContain("/telegram-connect");
   });
 
-  it("cancelled switch never re-arms", async () => {
+  it("cancelled switch never releases or re-arms", async () => {
     makeProjects(["alpha", "beta"]);
     writeOwners(freshEntry());
     makeFakeSession("cancel-beta.jsonl");
@@ -1580,14 +1601,52 @@ describe("telegram transport re-arm after session switch", () => {
     const ctx = createFakeCtx({ switchSession: vi.fn(async () => ({ cancelled: true })) });
     await cmd.options.handler("beta", ctx);
 
+    // release happened before the (cancelled) switch …
+    expect(piSentTexts(pi)).toContain("/telegram-disconnect");
+    // … so the cancelled path reconnects from the old runtime
+    expect(piSentTexts(pi)).toContain("/telegram-connect");
+  });
+
+  it("a throwing disconnect abandons the re-arm but never breaks the switch", async () => {
+    makeProjects(["alpha", "beta"]);
+    writeOwners(freshEntry());
+    const betaSession = makeFakeSession("throw-beta.jsonl");
+    writeFileSync(
+      sessionMapPath,
+      JSON.stringify({ beta: { sessionFile: "throw-beta.jsonl", updatedAt: "x" } }),
+      "utf8"
+    );
+
+    const { pi, recorded, handlers } = createFakePi();
+    // make the release dispatch throw
+    (pi.sendUserMessage as any).mockRejectedValueOnce(new Error("stale ctx"));
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    await fire(
+      "input",
+      handlers,
+      { type: "input", text: "[telegram] /project beta", source: "extension" },
+      createFakeCtx()
+    );
+    const cmd = recorded.commands.find((c: any) => c.name === "project")!;
+    const ctx = createFakeCtx();
+    await cmd.options.handler("beta", ctx);
+
+    // the switch itself still happened
+    expect(ctx.switchSession).toHaveBeenCalledWith(
+      betaSession,
+      expect.objectContaining({ withSession: expect.any(Function) })
+    );
+    const opts = (ctx.switchSession as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    const newCtx: any = createFakeCtx();
+    newCtx.sendUserMessage = vi.fn(async () => {});
+    await opts.withSession(newCtx);
+
     vi.useFakeTimers();
-    vi.advanceTimersByTime(20_000);
-    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(3_000);
     vi.useRealTimers();
-    // only the cancellation notice went out; no /telegram-connect anywhere
-    for (const call of (pi.sendUserMessage as any).mock.calls) {
-      expect(call[0]).not.toBe("/telegram-connect");
-    }
+    expect(ctxSentTexts(newCtx)).not.toContain("/telegram-connect");
   });
 
   it("scheduling a second re-arm supersedes the pending one (fires exactly once)", async () => {
@@ -1609,6 +1668,7 @@ describe("telegram transport re-arm after session switch", () => {
         JSON.stringify({ alpha: { sessionFile: "rearm-alpha.jsonl", updatedAt: "x" } }),
         "utf8"
       );
+      writeOwners(freshEntry());
       await fire(
         "input",
         handlers,
@@ -1623,21 +1683,15 @@ describe("telegram transport re-arm after session switch", () => {
       secondCtx.sendUserMessage = vi.fn(async () => {});
       await opts2.withSession(secondCtx);
 
-      await vi.advanceTimersByTimeAsync(9_000);
+      await vi.advanceTimersByTimeAsync(3_000);
 
       // the superseded first context never re-armed
-      const firstRearm = (first.newCtx.sendUserMessage as any).mock.calls.filter(
-        (c: any[]) => c[0] === "/telegram-connect"
-      );
-      expect(firstRearm).toHaveLength(0);
+      expect(ctxSentTexts(first.newCtx)).not.toContain("/telegram-connect");
       // exactly one re-arm, from the current runtime
-      const secondRearm = (secondCtx.sendUserMessage as any).mock.calls.filter(
-        (c: any[]) => c[0] === "/telegram-connect"
-      );
-      expect(secondRearm).toHaveLength(1);
+      const secondConnects = ctxSentTexts(secondCtx).filter((t) => t === "/telegram-connect");
+      expect(secondConnects).toHaveLength(1);
     } finally {
       vi.useRealTimers();
     }
   });
-
 });
