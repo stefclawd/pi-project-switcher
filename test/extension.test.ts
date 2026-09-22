@@ -1146,7 +1146,7 @@ describe("telegram switch confirmation", () => {
 
     // run the withSession callback against a fresh context (as pi would)
     const opts = (ctx.switchSession as ReturnType<typeof vi.fn>).mock.calls[0][1];
-    const newCtx = createFakeCtx();
+    const newCtx: any = createFakeCtx();
     newCtx.sendUserMessage = vi.fn(async () => {});
     await opts.withSession(newCtx);
 
@@ -1202,7 +1202,7 @@ describe("telegram switch confirmation", () => {
     await cmd.options.handler("beta", ctx);
 
     const opts = (ctx.switchSession as ReturnType<typeof vi.fn>).mock.calls[0][1];
-    const newCtx = createFakeCtx();
+    const newCtx: any = createFakeCtx();
     newCtx.sendUserMessage = vi.fn(async () => {});
     await opts.withSession(newCtx);
 
