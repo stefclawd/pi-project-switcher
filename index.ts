@@ -29,6 +29,10 @@ const HOME = homedir();
 const ENTRY_TYPE = "project-switcher-state";
 const SESSIONS_DIR = join(HOME, ".pi", "agent", "sessions");
 const SESSION_MAP_PATH = join(HOME, ".pi", "agent", "project-switcher-sessions.json");
+const TELEGRAM_TMP_DIR = join(HOME, ".pi", "agent", "tmp", "telegram");
+const TELEGRAM_STATE_PATH = join(TELEGRAM_TMP_DIR, "state.json");
+const TELEGRAM_OWNERS_PATH = join(TELEGRAM_TMP_DIR, "owners.json");
+const TELEGRAM_CONFIG_PATH = join(HOME, ".pi", "agent", "telegram.json");
 
 interface Config {
   baseDir: string;
@@ -344,7 +348,15 @@ function buildTelegramNoChangePrompt(text: string): string {
  * bridge's diagnosis guidance.
  */
 function telegramOwnersPath(): string {
-  return join(HOME, ".pi", "agent", "tmp", "telegram", "owners.json");
+  return telegramPaths.owners ?? TELEGRAM_OWNERS_PATH;
+}
+
+/**
+ * pi-telegram's runtime state snapshot — written on a scheduler and on
+ * status changes; read-only for the switcher.
+ */
+function telegramStatePath(): string {
+  return telegramPaths.state ?? TELEGRAM_STATE_PATH;
 }
 
 /**
@@ -362,6 +374,39 @@ const TELEGRAM_OWNERSHIP_FRESH_MS = 10_000;
  * racing the session-replacement lifecycle observers.
  */
 const TELEGRAM_REARM_DELAY_MS = 3_000;
+
+/**
+ * Poll interval for the re-arm verification: how often the state snapshot
+ * and lock heartbeat are re-read while waiting for the transport to come
+ * back after the reconnect dispatch.
+ */
+const TELEGRAM_REARM_POLL_MS = 500;
+
+/**
+ * Bound for the re-arm verification, measured from the moment the
+ * /telegram-connect dispatch completes. When the transport has not
+ * verifiably re-armed within this window, the queued confirmation falls
+ * back to the direct Bot-API warning (its follow-up reply would be
+ * undeliverable anyway while the transport is down).
+ */
+const TELEGRAM_REARM_BOUND_MS = 10_000;
+
+/**
+ * Test seam: paths for the re-arm verification reads. Tests point these
+ * at fixture files; production code always uses the real paths.
+ */
+export const telegramPaths: { state?: string; owners?: string } = {};
+
+/**
+ * Test seam: Bot-API warning sender override. When set, the fallback uses
+ * this instead of reading telegram.json and calling the Telegram HTTPS
+ * API. Signature: (text) => Promise<void> (may throw; callers guard).
+ */
+export let botApiWarningSender: ((text: string) => Promise<void>) | null = null;
+
+export function setBotApiWarningSender(sender: ((text: string) => Promise<void>) | null): void {
+  botApiWarningSender = sender;
+}
 
 /**
  * Release the Telegram transport from the OLD (owning) runtime, before
@@ -423,19 +468,173 @@ function probeTelegramTransportOwnership(oldCwd: string): boolean {
 }
 
 /**
- * Pending re-arm timer (single slot): scheduling a new re-arm supersedes
- * a not-yet-fired previous one. The callback only touches the withSession
- * context it was scheduled with, so it can never act on a stale runtime.
+ * Read-only re-arm verification: has the transport verifiably come back in
+ * THIS process after the reconnect dispatch? True iff (a) the ownership
+ * lock has a fresh entry for the current process (the connect handler
+ * acquires the lock synchronously) and (b) pi-telegram's state snapshot
+ * shows polling as active (or is not yet readable — the snapshot is
+ * written on a scheduler, so the fresh lock heartbeat is the primary
+ * signal and the snapshot must not contradict it with polling stopped).
+ */
+function probeTelegramRearmConfirmed(): boolean {
+  // (a) fresh same-pid lock entry (cwd irrelevant: the new runtime has the
+  // new session's cwd by design — the re-arm is exactly the ownership
+  // handoff across that cwd change).
+  let ownsFreshLock = false;
+  try {
+    const raw = JSON.parse(readFileSync(telegramOwnersPath(), "utf8"));
+    if (raw && typeof raw === "object") {
+      for (const entry of Object.values(raw) as any[]) {
+        if (
+          entry &&
+          typeof entry === "object" &&
+          entry.pid === process.pid &&
+          typeof entry.heartbeatMs === "number" &&
+          Date.now() - entry.heartbeatMs <= TELEGRAM_OWNERSHIP_FRESH_MS
+        ) {
+          ownsFreshLock = true;
+          break;
+        }
+      }
+    }
+  } catch {
+    return false; // missing/malformed lock: not re-armed
+  }
+  if (!ownsFreshLock) return false;
+
+  // (b) state snapshot: polling must not be stopped. A missing/unreadable
+  // snapshot does not block confirmation (the lock is authoritative for
+  // ownership; polling starts with the connect).
+  try {
+    const raw = JSON.parse(readFileSync(telegramStatePath(), "utf8"));
+    const pollingActive = raw?.runtime?.pollingActive;
+    if (typeof pollingActive === "boolean" && !pollingActive) {
+      return false;
+    }
+  } catch {
+    // snapshot absent or stale: rely on the lock heartbeat alone
+  }
+  return true;
+}
+
+/**
+ * Bounded wait for the verified re-arm. Polls the lock + state snapshot at
+ * a short interval for up to TELEGRAM_REARM_BOUND_MS. Never throws.
+ */
+async function waitForTelegramRearm(): Promise<{ confirmed: boolean; reason?: string }> {
+  const deadline = Date.now() + TELEGRAM_REARM_BOUND_MS;
+  for (;;) {
+    if (probeTelegramRearmConfirmed()) {
+      return { confirmed: true };
+    }
+    if (Date.now() >= deadline) {
+      return {
+        confirmed: false,
+        reason: "telegram transport did not re-arm within 10s of the reconnect dispatch",
+      };
+    }
+    await new Promise((resolve) => setTimeout(resolve, TELEGRAM_REARM_POLL_MS));
+  }
+}
+
+/**
+ * Direct Telegram Bot-API warning fallback. Reads the bot token and the
+ * allowed user id from ~/.pi/agent/telegram.json and sends one plain
+ * message via the public HTTPS API — usable precisely when the extension
+ * transport is dead. Never throws; failures are returned as a reason so
+ * the caller can journal them. `project` names the switched-to project.
+ */
+async function sendBotApiRearmWarning(project: string): Promise<string | null> {
+  if (botApiWarningSender) {
+    try {
+      await botApiWarningSender(`⚠️ Switched to ${project}, but reconnecting the pi Telegram extension did not work — Telegram commands may not reach the agent until it reconnects (/telegram-connect).`);
+      return null;
+    } catch (err: any) {
+      return `Bot-API warning send failed: ${err?.message ?? err}`;
+    }
+  }
+
+  // Read token + chat id from the bridge configuration.
+  let token = "";
+  let chatId: number | undefined;
+  try {
+    const raw = JSON.parse(readFileSync(TELEGRAM_CONFIG_PATH, "utf8"));
+    const profile = raw?.profiles?.default ?? raw;
+    token = typeof profile?.botToken === "string" ? profile.botToken : "";
+    chatId = typeof profile?.allowedUserId === "number" ? profile.allowedUserId : undefined;
+  } catch {
+    return "Bot-API warning skipped: ~/.pi/agent/telegram.json unreadable";
+  }
+  if (!token || chatId === undefined) {
+    return "Bot-API warning skipped: bot token or allowed user id missing";
+  }
+
+  const text =
+    `⚠️ Switched to ${project}, but reconnecting the pi Telegram extension did not work ` +
+    `— Telegram commands may not reach the agent until it reconnects (/telegram-connect).`;
+  try {
+    const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text }),
+    });
+    if (!response.ok) {
+      return `Bot-API warning failed: HTTP ${response.status}`;
+    }
+    return null;
+  } catch (err: any) {
+    return `Bot-API warning send failed: ${err?.message ?? err}`;
+  }
+}
+
+interface QueuedTelegramFollowUp {
+  /** Prompt for the confirmation follow-up turn (built at queue time). */
+  prompt: string;
+  /** Project name, for the Bot-API fallback warning. */
+  project: string;
+}
+
+/**
+ * Pending combined re-arm callback (single slot): scheduling a new one
+ * supersedes a not-yet-fired previous one. The callback only touches the
+ * withSession context it was scheduled with, so it can never act on a
+ * stale runtime.
  */
 let pendingRearmTimer: ReturnType<typeof setTimeout> | null = null;
 
-function scheduleTelegramRearm(newCtx: any, source: string): void {
+function clearPendingRearm(): void {
   if (pendingRearmTimer) {
     clearTimeout(pendingRearmTimer);
     pendingRearmTimer = null;
   }
+}
+
+/**
+ * Schedule the transport re-arm from the fresh runtime: after the safety
+ * delay, re-dispatch /telegram-connect, wait until the re-arm is VERIFIED
+ * (bounded), then dispatch the queued confirmation follow-up. When the
+ * re-arm does not confirm within the bound (or the connect dispatch
+ * fails), the confirmation turn is NOT dispatched (its reply would be
+ * undeliverable); instead a plain warning goes out directly through the
+ * Telegram Bot API and the failure is journaled locally. Every step is
+ * guarded: an error inside this timer callback must never kill the daemon.
+ */
+function scheduleTelegramRearm(
+  newCtx: any,
+  source: string,
+  queuedFollowUp: QueuedTelegramFollowUp | null,
+): void {
+  clearPendingRearm();
   const timer = setTimeout(async () => {
     pendingRearmTimer = null;
+    const journal = (message: string) => {
+      try {
+        newCtx.ui.notify(message, "warning");
+      } catch {
+        // The fresh context can be gone (e.g. another switch followed):
+        // never let an error escape into an uncaught timer callback.
+      }
+    };
     try {
       // Command re-dispatch from the FRESH runtime: executes pi-telegram's
       // connect handler (no agent turn). The lock was released by the
@@ -446,16 +645,36 @@ function scheduleTelegramRearm(newCtx: any, source: string): void {
         expandPromptTemplates: true,
       });
     } catch (err: any) {
-      try {
-        newCtx.ui.notify(
-          `Telegram re-arm after ${source} switch failed: ${err?.message ?? err}`,
-          "warning"
-        );
-      } catch {
-        // Even the fresh context can be gone (e.g. another switch followed):
-        // never let an error escape into an uncaught timer callback.
+      journal(`Telegram re-arm after ${source} switch failed: ${err?.message ?? err}`);
+      if (queuedFollowUp) {
+        const warnError = await sendBotApiRearmWarning(queuedFollowUp.project);
+        if (warnError) journal(warnError);
       }
+      return;
     }
+
+    if (!queuedFollowUp) return;
+
+    // Wait for the verified re-arm before dispatching the confirmation:
+    // a follow-up reply finishing while the transport is still down is
+    // dropped silently by pi-telegram (observed 2026-09-22).
+    const rearm = await waitForTelegramRearm();
+    if (rearm.confirmed) {
+      try {
+        await newCtx.sendUserMessage(queuedFollowUp.prompt, {
+          deliverAs: "followUp",
+        });
+      } catch (err: any) {
+        journal(`Telegram confirmation after ${source} switch failed: ${err?.message ?? err}`);
+      }
+      return;
+    }
+
+    // Re-arm not verifiable in time: the follow-up reply would be
+    // undeliverable — warn directly through the Bot API instead.
+    journal(`Telegram re-arm verification after ${source} switch timed out: ${rearm.reason}`);
+    const warnError = await sendBotApiRearmWarning(queuedFollowUp.project);
+    if (warnError) journal(warnError);
   }, TELEGRAM_REARM_DELAY_MS);
   timer.unref?.();
   pendingRearmTimer = timer;
@@ -712,6 +931,13 @@ export default function (pi: ExtensionAPI) {
       // with "stale ctx" errors and killed the whole flow).
       const branch = getGitBranch(projectPath(name));
       const branchStr = branch ? ` on branch \`${branch}\`` : "";
+      const confirmPrompt = buildTelegramSwitchConfirmationPrompt({
+        project: name,
+        path: projectPath(name),
+        branchStr,
+        sessionLine: `🗂 Session restored: ${basename(targetSession)}`,
+        previous,
+      });
       // Ownership probe BEFORE the switch (the old session's cwd is only
       // available here): when the session we are leaving is the live owner
       // of the connected Telegram transport, the transport must be carried
@@ -744,29 +970,33 @@ export default function (pi: ExtensionAPI) {
             `Workdir: ${projectPath(name)}${branchStr ? ` ${branchStr}` : ""}`,
             "info"
           );
-          if (isTelegramOrigin) {
-            // Confirmation turn from the FRESH runtime: the reply reaches
-            // the Telegram chat (the local notify above never does). Only
-            // the new context is touched — the pre-switch pi/ctx are stale.
-            // The turn also settles pi-telegram's dispatch queue.
+          if (isTelegramOrigin && releasedTelegramTransport) {
+            // The pre-switch disconnect released the transport; the new
+            // runtime re-arms it after a short safety delay. The
+            // confirmation turn must NOT be dispatched until the re-arm is
+            // VERIFIED: a follow-up reply finishing while the transport is
+            // still down is dropped silently by pi-telegram (observed
+            // 2026-09-22). Queue it with the re-arm: connect → verified
+            // polling → confirmation from this fresh context; on timeout,
+            // a plain warning goes out directly via the Telegram Bot API.
+            scheduleTelegramRearm(newCtx, name, { prompt: confirmPrompt, project: name });
+          } else if (isTelegramOrigin) {
+            // No transport transition (probe failed): the transport was
+            // never released, so there is no dead window — the
+            // confirmation turn is safe immediately. The turn also settles
+            // pi-telegram's dispatch queue.
             await newCtx.waitForIdle();
-            await newCtx.sendUserMessage(
-              buildTelegramSwitchConfirmationPrompt({
-                project: name,
-                path: projectPath(name),
-                branchStr,
-                sessionLine: `🗂 Session restored: ${basename(targetSession)}`,
-                previous,
-              }),
-              { deliverAs: "followUp" }
-            );
+            await newCtx.sendUserMessage(confirmPrompt, { deliverAs: "followUp" });
           }
           if (releasedTelegramTransport) {
-            // Re-arm the Telegram transport from the fresh runtime. The lock
-            // was released by the pre-switch disconnect, so this connect
-            // acquires unconditionally after the short safety delay. Only
-            // the withSession context is touched (see scheduleTelegramRearm).
-            scheduleTelegramRearm(newCtx, name);
+            // Re-arm the Telegram transport from the fresh runtime (queued
+            // together with the confirmation above when both apply). The
+            // lock was released by the pre-switch disconnect, so this
+            // connect acquires unconditionally after the short safety
+            // delay. Only the withSession context is touched.
+            if (!isTelegramOrigin) {
+              scheduleTelegramRearm(newCtx, name, null);
+            }
           }
         },
       });
@@ -928,3 +1158,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 }
+
+// ── Test-only hooks (never imported in production) ────────────────────────
+export const __testProbeRearm = probeTelegramRearmConfirmed;
+export const __testClearRearm = clearPendingRearm;

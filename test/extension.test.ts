@@ -1384,6 +1384,22 @@ describe("telegram transport re-arm after session switch", () => {
     writeFileSync(ownersPath(), JSON.stringify({ [key]: entry }), "utf8");
   }
 
+  /** Write a pi-telegram state snapshot with the given polling flag. */
+  function writeState(pollingActive: boolean): void {
+    mkdirSync(join(fakeHome, ".pi", "agent", "tmp", "telegram"), { recursive: true });
+    writeFileSync(
+      join(fakeHome, ".pi", "agent", "tmp", "telegram", "state.json"),
+      JSON.stringify({ version: 1, runtime: { pollingActive, lockState: "active here" } }),
+      "utf8"
+    );
+  }
+
+  /** Simulate the completed re-arm: fresh lock + polling snapshot. */
+  function simulateRearm(): void {
+    writeOwners(freshEntry());
+    writeState(true);
+  }
+
   function freshEntry(overrides: Record<string, any> = {}) {
     return {
       pid: process.pid,
@@ -1451,6 +1467,173 @@ describe("telegram transport re-arm after session switch", () => {
       const connects = ctxSentTexts(newCtx).filter((t) => t === "/telegram-connect");
       expect(connects).toHaveLength(1);
     } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("queues the confirmation until the re-arm is verified, then dispatches it", async () => {
+    makeProjects(["alpha", "beta"]);
+    writeOwners(freshEntry());
+    const { pi, recorded, handlers } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    vi.useFakeTimers();
+    try {
+      const { newCtx } = await runRestoreSwitch(handlers, recorded);
+
+      // confirmation NOT dispatched from withSession while the transport is down
+      const confirmations = () =>
+        ctxSentTexts(newCtx).filter((t) => t.startsWith("[project-switcher]"));
+      expect(confirmations()).toHaveLength(0);
+
+      // The disconnect removed the lock BEFORE the connect fires: write the
+      // transport-down state now (pi-telegram deletes its owners.json entry
+      // on disconnect).
+      writeOwners({});
+      // re-arm fires after the safety delay …
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(ctxSentTexts(newCtx)).toContain("/telegram-connect");
+      // … but the transport is still down -> still no confirmation
+      await vi.advanceTimersByTimeAsync(500);
+      expect(confirmations()).toHaveLength(0);
+
+      // transport re-arms: fresh lock + active polling -> confirmation goes out
+      simulateRearm();
+      await vi.advanceTimersByTimeAsync(500);
+      expect(confirmations()).toHaveLength(1);
+      expect(confirmations()[0]).toContain("Switched to **beta**");
+      expect(confirmations()[0]).toContain("{📋 Projects|/project}");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("sends the Bot-API warning when the re-arm never confirms within 10s", async () => {
+    makeProjects(["alpha", "beta"]);
+    writeOwners(freshEntry());
+    const { pi, recorded, handlers } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    const warnings: string[] = [];
+    const mod: any = await import(new URL("../index.ts", import.meta.url).href);
+    mod.setBotApiWarningSender(async (text: string) => {
+      warnings.push(text);
+    });
+
+    vi.useFakeTimers();
+    try {
+      const { newCtx } = await runRestoreSwitch(handlers, recorded);
+      // The disconnect removed the lock BEFORE the connect fires.
+      writeOwners({});
+      await vi.advanceTimersByTimeAsync(3_000);
+      expect(ctxSentTexts(newCtx)).toContain("/telegram-connect");
+
+      // transport never re-arms
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      // no confirmation follow-up …
+      expect(
+        ctxSentTexts(newCtx).filter((t) => t.startsWith("[project-switcher]"))
+      ).toHaveLength(0);
+      // … but the Bot-API warning went out
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain("beta");
+      expect(warnings[0]).toContain("did not work");
+      // and the failure was journaled locally
+      expect(newCtx.ui.notify).toHaveBeenCalledWith(
+        expect.stringContaining("timed out"),
+        "warning"
+      );
+    } finally {
+      mod.setBotApiWarningSender(null);
+      vi.useRealTimers();
+    }
+  });
+
+  it("sends the Bot-API warning when the connect dispatch throws", async () => {
+    makeProjects(["alpha", "beta"]);
+    writeOwners(freshEntry());
+    const { pi, recorded, handlers } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    const mod: any = await import(new URL("../index.ts", import.meta.url).href);
+    const warnings: string[] = [];
+    mod.setBotApiWarningSender(async (text: string) => {
+      warnings.push(text);
+    });
+
+    vi.useFakeTimers();
+    try {
+      // runRestoreSwitch but with a throwing connect
+      const betaSession = makeFakeSession("rearm-throw.jsonl");
+      writeFileSync(
+        sessionMapPath,
+        JSON.stringify({ beta: { sessionFile: "rearm-throw.jsonl", updatedAt: "x" } }),
+        "utf8"
+      );
+      await fire(
+        "input",
+        handlers,
+        { type: "input", text: "[telegram] /project beta", source: "extension" },
+        createFakeCtx()
+      );
+      const cmd = recorded.commands.find((c: any) => c.name === "project")!;
+      const ctx = createFakeCtx({ cwd: process.cwd() });
+      await cmd.options.handler("beta", ctx);
+      const opts = (ctx.switchSession as ReturnType<typeof vi.fn>).mock.calls[0][1];
+      const newCtx: any = createFakeCtx();
+      newCtx.sendUserMessage = vi.fn(async (text: string) => {
+        if (text === "/telegram-connect") throw new Error("stale ctx");
+      });
+      await opts.withSession(newCtx);
+
+      await vi.advanceTimersByTimeAsync(3_000);
+
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain("beta");
+      expect(
+        ctxSentTexts(newCtx).filter((t) => t.startsWith("[project-switcher]"))
+      ).toHaveLength(0);
+      expect(newCtx.ui.notify).toHaveBeenCalledWith(
+        expect.stringContaining("stale ctx"),
+        "warning"
+      );
+    } finally {
+      mod.setBotApiWarningSender(null);
+      vi.useRealTimers();
+    }
+  });
+
+  it("journals when the Bot-API sender itself fails; never throws", async () => {
+    makeProjects(["alpha", "beta"]);
+    writeOwners(freshEntry());
+    const { pi, recorded, handlers } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    const mod: any = await import(new URL("../index.ts", import.meta.url).href);
+    mod.setBotApiWarningSender(async () => {
+      throw new Error("network down");
+    });
+
+    vi.useFakeTimers();
+    try {
+      const { newCtx } = await runRestoreSwitch(handlers, recorded);
+      writeOwners({}); // transport never re-arms (lock gone after disconnect)
+      await vi.advanceTimersByTimeAsync(3_000 + 10_000);
+
+      expect(
+        ctxSentTexts(newCtx).filter((t) => t.startsWith("[project-switcher]"))
+      ).toHaveLength(0);
+      expect(newCtx.ui.notify).toHaveBeenCalledWith(
+        expect.stringContaining("network down"),
+        "warning"
+      );
+    } finally {
+      mod.setBotApiWarningSender(null);
       vi.useRealTimers();
     }
   });
