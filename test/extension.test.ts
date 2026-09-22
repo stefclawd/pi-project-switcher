@@ -1366,3 +1366,278 @@ describe("telegram switch confirmation", () => {
     expect(statusContent).toContain("{📁 alpha|/project alpha}");
   });
 });
+
+// ── Telegram transport re-arm after session switch ────────────────────────
+
+describe("telegram transport re-arm after session switch", () => {
+  function ownersPath(): string {
+    return join(fakeHome, ".pi", "agent", "tmp", "telegram", "owners.json");
+  }
+
+  function writeOwners(entry: Record<string, any> | null, key = "default"): void {
+    mkdirSync(join(fakeHome, ".pi", "agent", "tmp", "telegram"), { recursive: true });
+    if (entry === null) {
+      // malformed content
+      writeFileSync(ownersPath(), "not json {", "utf8");
+      return;
+    }
+    writeFileSync(ownersPath(), JSON.stringify({ [key]: entry }), "utf8");
+  }
+
+  function freshEntry(overrides: Record<string, any> = {}) {
+    return {
+      pid: process.pid,
+      cwd: process.cwd(),
+      instanceId: `${process.pid}:now`,
+      heartbeatMs: Date.now(),
+      ...overrides,
+    };
+  }
+
+  /** Run a restore-path switch after arming the flag; returns the captured withSession ctx. */
+  async function runRestoreSwitch(handlers: Map<string, Handler>, recorded: any) {
+    const betaSession = makeFakeSession("rearm-beta.jsonl");
+    writeFileSync(
+      sessionMapPath,
+      JSON.stringify({ beta: { sessionFile: "rearm-beta.jsonl", updatedAt: "x" } }),
+      "utf8"
+    );
+    await fire(
+      "input",
+      handlers,
+      { type: "input", text: "[telegram] /project beta", source: "extension" },
+      createFakeCtx()
+    );
+    const cmd = recorded.commands.find((c: any) => c.name === "project")!;
+    const ctx = createFakeCtx({ cwd: process.cwd() });
+    await cmd.options.handler("beta", ctx);
+    const opts = (ctx.switchSession as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    const newCtx: any = createFakeCtx();
+    newCtx.sendUserMessage = vi.fn(async () => {});
+    await opts.withSession(newCtx);
+    return { ctx, newCtx };
+  }
+
+  it("re-arms after the delay when the probe passes (fresh same-pid same-cwd lock)", async () => {
+    makeProjects(["alpha", "beta"]);
+    writeOwners(freshEntry());
+    const { pi, recorded, handlers } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    vi.useFakeTimers();
+    try {
+      const { newCtx } = await runRestoreSwitch(handlers, recorded);
+
+      // not yet: the re-arm waits past pi-telegram's staleness window
+      expect(newCtx.sendUserMessage).toHaveBeenCalledTimes(1); // confirmation turn only
+
+      await vi.advanceTimersByTimeAsync(9_000);
+
+      const calls = (newCtx.sendUserMessage as any).mock.calls;
+      const rearm = calls[calls.length - 1];
+      expect(rearm[0]).toBe("/telegram-connect");
+      expect(rearm[1]).toEqual({ expandPromptTemplates: true });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not re-arm when the lock belongs to a different pid", async () => {
+    makeProjects(["alpha", "beta"]);
+    writeOwners(freshEntry({ pid: process.pid + 1 }));
+    const { pi, recorded, handlers } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    const { newCtx } = await runRestoreSwitch(handlers, recorded);
+    vi.useFakeTimers();
+    vi.advanceTimersByTime(20_000);
+    await Promise.resolve();
+    vi.useRealTimers();
+    expect((newCtx.sendUserMessage as any).mock.calls).toHaveLength(1); // confirmation only
+  });
+
+  it("does not re-arm when the heartbeat is stale", async () => {
+    makeProjects(["alpha", "beta"]);
+    writeOwners(freshEntry({ heartbeatMs: Date.now() - 60_000 }));
+    const { pi, recorded, handlers } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    const { newCtx } = await runRestoreSwitch(handlers, recorded);
+    vi.useFakeTimers();
+    vi.advanceTimersByTime(20_000);
+    await Promise.resolve();
+    vi.useRealTimers();
+    expect((newCtx.sendUserMessage as any).mock.calls).toHaveLength(1);
+  });
+
+  it("does not re-arm when the lock cwd does not match the old session", async () => {
+    makeProjects(["alpha", "beta"]);
+    writeOwners(freshEntry({ cwd: "/somewhere/else" }));
+    const { pi, recorded, handlers } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    const { newCtx } = await runRestoreSwitch(handlers, recorded);
+    vi.useFakeTimers();
+    vi.advanceTimersByTime(20_000);
+    await Promise.resolve();
+    vi.useRealTimers();
+    expect((newCtx.sendUserMessage as any).mock.calls).toHaveLength(1);
+  });
+
+  it("does not re-arm when owners.json is missing or malformed", async () => {
+    for (const malformed of [null]) {
+      makeProjects(["alpha", "beta"]);
+      writeOwners(malformed);
+      const { pi, recorded, handlers } = createFakePi();
+      const { default: factory } = await loadExtension();
+      factory(pi);
+
+      const { newCtx } = await runRestoreSwitch(handlers, recorded);
+      vi.useFakeTimers();
+      vi.advanceTimersByTime(20_000);
+      await Promise.resolve();
+      vi.useRealTimers();
+      expect((newCtx.sendUserMessage as any).mock.calls).toHaveLength(1);
+    }
+  });
+
+  it("re-arms when the lock carries no cwd", async () => {
+    makeProjects(["alpha", "beta"]);
+    const entry: Record<string, any> = freshEntry();
+    delete entry.cwd;
+    writeOwners(entry);
+    const { pi, recorded, handlers } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    vi.useFakeTimers();
+    try {
+      const { newCtx } = await runRestoreSwitch(handlers, recorded);
+      await vi.advanceTimersByTimeAsync(9_000);
+      const calls = (newCtx.sendUserMessage as any).mock.calls;
+      expect(calls[calls.length - 1][0]).toBe("/telegram-connect");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("native switch never consults the lock or re-arms", async () => {
+    makeProjects(["alpha", "beta"]);
+    writeOwners(freshEntry());
+    const betaSession = makeFakeSession("native-beta.jsonl");
+    writeFileSync(
+      sessionMapPath,
+      JSON.stringify({ beta: { sessionFile: "native-beta.jsonl", updatedAt: "x" } }),
+      "utf8"
+    );
+
+    const { pi, recorded } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    const cmd = recorded.commands.find((c: any) => c.name === "project")!;
+    const ctx = createFakeCtx();
+    await cmd.options.handler("beta", ctx);
+    const opts = (ctx.switchSession as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    const newCtx: any = createFakeCtx();
+    newCtx.sendUserMessage = vi.fn(async () => {});
+    await opts.withSession(newCtx);
+
+    vi.useFakeTimers();
+    vi.advanceTimersByTime(20_000);
+    await Promise.resolve();
+    vi.useRealTimers();
+    // no confirmation turn, no re-arm — native switch is unchanged
+    expect(newCtx.sendUserMessage).not.toHaveBeenCalled();
+    expect(pi.sendUserMessage).not.toHaveBeenCalled();
+  });
+
+  it("cancelled switch never re-arms", async () => {
+    makeProjects(["alpha", "beta"]);
+    writeOwners(freshEntry());
+    makeFakeSession("cancel-beta.jsonl");
+    writeFileSync(
+      sessionMapPath,
+      JSON.stringify({ beta: { sessionFile: "cancel-beta.jsonl", updatedAt: "x" } }),
+      "utf8"
+    );
+
+    const { pi, recorded, handlers } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    await fire(
+      "input",
+      handlers,
+      { type: "input", text: "[telegram] /project beta", source: "extension" },
+      createFakeCtx()
+    );
+    const cmd = recorded.commands.find((c: any) => c.name === "project")!;
+    const ctx = createFakeCtx({ switchSession: vi.fn(async () => ({ cancelled: true })) });
+    await cmd.options.handler("beta", ctx);
+
+    vi.useFakeTimers();
+    vi.advanceTimersByTime(20_000);
+    await Promise.resolve();
+    vi.useRealTimers();
+    // only the cancellation notice went out; no /telegram-connect anywhere
+    for (const call of (pi.sendUserMessage as any).mock.calls) {
+      expect(call[0]).not.toBe("/telegram-connect");
+    }
+  });
+
+  it("scheduling a second re-arm supersedes the pending one (fires exactly once)", async () => {
+    makeProjects(["alpha", "beta"]);
+    writeOwners(freshEntry());
+    const { pi, recorded, handlers } = createFakePi();
+    const { default: factory } = await loadExtension();
+    factory(pi);
+
+    vi.useFakeTimers();
+    try {
+      // first restore switch (alpha-session runtime -> beta)
+      const first = await runRestoreSwitch(handlers, recorded);
+
+      // second restore switch before the first timer fired (beta -> alpha)
+      const alphaSession = makeFakeSession("rearm-alpha.jsonl");
+      writeFileSync(
+        sessionMapPath,
+        JSON.stringify({ alpha: { sessionFile: "rearm-alpha.jsonl", updatedAt: "x" } }),
+        "utf8"
+      );
+      await fire(
+        "input",
+        handlers,
+        { type: "input", text: "[telegram] /project alpha", source: "extension" },
+        createFakeCtx()
+      );
+      const cmd = recorded.commands.find((c: any) => c.name === "project")!;
+      const ctx2 = createFakeCtx();
+      await cmd.options.handler("alpha", ctx2);
+      const opts2 = (ctx2.switchSession as ReturnType<typeof vi.fn>).mock.calls[0][1];
+      const secondCtx: any = createFakeCtx();
+      secondCtx.sendUserMessage = vi.fn(async () => {});
+      await opts2.withSession(secondCtx);
+
+      await vi.advanceTimersByTimeAsync(9_000);
+
+      // the superseded first context never re-armed
+      const firstRearm = (first.newCtx.sendUserMessage as any).mock.calls.filter(
+        (c: any[]) => c[0] === "/telegram-connect"
+      );
+      expect(firstRearm).toHaveLength(0);
+      // exactly one re-arm, from the current runtime
+      const secondRearm = (secondCtx.sendUserMessage as any).mock.calls.filter(
+        (c: any[]) => c[0] === "/telegram-connect"
+      );
+      expect(secondRearm).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+});

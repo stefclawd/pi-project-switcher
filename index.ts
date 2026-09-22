@@ -335,6 +335,103 @@ function buildTelegramNoChangePrompt(text: string): string {
   );
 }
 
+// ── Telegram transport ownership probe & re-arm ──────────────────────────────
+
+/**
+ * Path of pi-telegram's transport ownership lock. The switcher only ever
+ * READS this file (pi-telegram's own connect handler performs the actual
+ * acquisition); mutating it by hand is explicitly forbidden by the
+ * bridge's diagnosis guidance.
+ */
+function telegramOwnersPath(): string {
+  return join(HOME, ".pi", "agent", "tmp", "telegram", "owners.json");
+}
+
+/**
+ * Freshness bound for the ownership probe. Deliberately LOOSER than
+ * pi-telegram's 8s staleness window: a passing probe means the owner
+ * runtime was definitely alive at switch time (a false positive here only
+ * leads to a connect attempt that pi-telegram itself re-validates).
+ */
+const TELEGRAM_OWNERSHIP_FRESH_MS = 10_000;
+
+/**
+ * Delay before re-dispatching /telegram-connect after a session-replacing
+ * switch. Must exceed pi-telegram's lock staleness window (8s): the
+ * suspended old runtime stops refreshing the heartbeat at session
+ * shutdown, and a *stale* lock is the only one the connect handler's
+ * non-forced acquire can replace across a cwd mismatch.
+ */
+const TELEGRAM_REARM_DELAY_MS = 9_000;
+
+/**
+ * Read-only probe: is the session we are about to leave the live owner of
+ * the connected Telegram transport? True iff pi-telegram's lock file has
+ * an entry for the current process whose heartbeat is fresh and whose cwd
+ * matches the old session's cwd (or is absent). This is the guard that
+ * prevents stealing the bot from a different pi instance or re-arming in
+ * a session that never used Telegram.
+ */
+function probeTelegramTransportOwnership(oldCwd: string): boolean {
+  try {
+    const raw = JSON.parse(readFileSync(telegramOwnersPath(), "utf8"));
+    if (!raw || typeof raw !== "object") return false;
+    // Any profile entry counts (the default profile uses the key "default").
+    for (const entry of Object.values(raw) as any[]) {
+      if (
+        entry &&
+        typeof entry === "object" &&
+        entry.pid === process.pid &&
+        typeof entry.heartbeatMs === "number" &&
+        Date.now() - entry.heartbeatMs <= TELEGRAM_OWNERSHIP_FRESH_MS &&
+        (entry.cwd === undefined || entry.cwd === oldCwd)
+      ) {
+        return true;
+      }
+    }
+    return false;
+  } catch {
+    // Missing or malformed lock file: transport not owned here.
+    return false;
+  }
+}
+
+/**
+ * Pending re-arm timer (single slot): scheduling a new re-arm supersedes
+ * a not-yet-fired previous one. The callback only touches the withSession
+ * context it was scheduled with, so it can never act on a stale runtime.
+ */
+let pendingRearmTimer: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleTelegramRearm(newCtx: any, source: string): void {
+  if (pendingRearmTimer) {
+    clearTimeout(pendingRearmTimer);
+    pendingRearmTimer = null;
+  }
+  const timer = setTimeout(async () => {
+    pendingRearmTimer = null;
+    try {
+      // Command re-dispatch from the FRESH runtime: executes pi-telegram's
+      // connect handler (no agent turn) and re-acquires the now-stale lock,
+      // restarting polling in the new session.
+      await newCtx.sendUserMessage("/telegram-connect", {
+        expandPromptTemplates: true,
+      });
+    } catch (err: any) {
+      try {
+        newCtx.ui.notify(
+          `Telegram re-arm after ${source} switch failed: ${err?.message ?? err}`,
+          "warning"
+        );
+      } catch {
+        // Even the fresh context can be gone (e.g. another switch followed):
+        // never let an error escape into an uncaught timer callback.
+      }
+    }
+  }, TELEGRAM_REARM_DELAY_MS);
+  timer.unref?.();
+  pendingRearmTimer = timer;
+}
 
 function getConfig(): Config {
   if (!config) {
@@ -587,6 +684,15 @@ export default function (pi: ExtensionAPI) {
       // with "stale ctx" errors and killed the whole flow).
       const branch = getGitBranch(projectPath(name));
       const branchStr = branch ? ` on branch \`${branch}\`` : "";
+      // Ownership probe BEFORE the switch (the old session's cwd is only
+      // available here): when the session we are leaving is the live owner
+      // of the connected Telegram transport, the new runtime must re-arm
+      // it after the switch (pi-telegram suspends polling on session
+      // shutdown and its auto-start declines the handoff across a cwd
+      // mismatch). The probe failing means we are NOT the owner (another
+      // pi instance, or Telegram was never connected here): re-arm nothing.
+      const ownedTelegramTransport =
+        isTelegramOrigin && probeTelegramTransportOwnership(ctx.cwd);
       const result = await ctx.switchSession(targetSession, {
         withSession: async (newCtx: any) => {
           // Safety net in case the restored session has no project entry:
@@ -616,6 +722,13 @@ export default function (pi: ExtensionAPI) {
               }),
               { deliverAs: "followUp" }
             );
+          }
+          if (ownedTelegramTransport) {
+            // Re-arm the Telegram transport from the fresh runtime. Only the
+            // withSession context is touched; the delay lets the old lock
+            // go stale (see TELEGRAM_REARM_DELAY_MS) so the connect
+            // handler's acquire can replace it across the cwd mismatch.
+            scheduleTelegramRearm(newCtx, name);
           }
         },
       });
