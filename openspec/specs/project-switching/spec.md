@@ -145,6 +145,14 @@ working directory and (b) the session identity the user now operates in.
 - **WHEN** a stored session is restored during the switch
 - **THEN** the session id (or, when not separately available, the session file name from which it is derivable) is included in the notification
 
+#### Scenario: Telegram-originated switch confirms in the chat
+
+- **WHEN** the switch was dispatched from the Telegram bridge
+- **THEN** the switch facts (project, working directory, session identity)
+  additionally reach the Telegram chat through the confirmation turn per
+  the Telegram Switch Confirmation requirement
+- **AND** the local UI notification is still emitted unchanged
+
 ### Requirement: Surface-Adaptive Status Output
 
 `/project` without arguments SHALL adapt its output to the surface the
@@ -182,6 +190,8 @@ Telegram bridge.
   bridge exactly as if the user had typed it
 - **AND** switch semantics (session restore, announcements, unknown-name
   rules) are identical to the typed command
+- **AND** the switch outcome is confirmed in the Telegram chat per the
+  Telegram Switch Confirmation requirement
 
 #### Scenario: Other surfaces keep the plain list
 
@@ -208,7 +218,89 @@ Telegram bridge.
 
 #### Scenario: Telegram flag is bounded
 
-- **WHEN** a Telegram-originated `/project` input arms the origin flag
-- **THEN** the flag is consumed by the next status execution and cleared
+- **WHEN** a Telegram-originated `/project` input (with or without
+  arguments) arms an origin flag
+- **THEN** the flag is consumed by the next matching execution (status
+  without arguments, switch with arguments) and cleared
 - **AND** the flag expires without effect after a short time-to-live
 - **AND** the flag is cleared on session start
+
+### Requirement: Telegram Switch Confirmation
+
+When `/project <name>` is dispatched from the Telegram bridge, the
+extension SHALL deliver a visible confirmation of the switch outcome to the
+Telegram chat: after a successful switch it starts a follow-up agent turn
+in the active (new) runtime whose reply confirms the switch, including the
+project name, its working directory, and the session identity per the
+Switch Output requirement. The confirmation SHALL be produced on both
+switch paths (restored session and same-session fallback).
+
+#### Scenario: Telegram switch with restored session is confirmed in the chat
+
+- **WHEN** `/project beta` is dispatched from the Telegram bridge and beta
+  has a stored, existing session file
+- **THEN** the session is switched to beta's stored session
+- **AND** a follow-up turn is started from the new runtime
+  (`withSession` context) whose reply reaches the Telegram chat
+- **AND** the reply confirms the switch to beta including its working
+  directory and the restored session identity
+
+#### Scenario: Telegram switch without stored session is confirmed in the chat
+
+- **WHEN** `/project beta` is dispatched from the Telegram bridge and beta
+  has no stored session file (or it no longer exists)
+- **THEN** the switch happens in the current session
+- **AND** a follow-up turn is started whose reply reaches the Telegram chat
+  and confirms the switch to beta (first session in the project)
+
+#### Scenario: Confirmation includes prompt buttons
+
+- **WHEN** the Telegram switch confirmation reply is composed
+- **THEN** it contains a pre-rendered `telegram_button` block with a
+  status button queuing `/project`
+- **AND** when a previous project exists, a switch-back button queuing
+  `/project <previous>` is included
+
+#### Scenario: Already-active switch answers the chat
+
+- **WHEN** `/project beta` is dispatched from the Telegram bridge and beta
+  is already the active project
+- **THEN** a short follow-up turn informs the chat that the project is
+  already active (no switch is performed)
+
+#### Scenario: Cancelled switch answers the chat
+
+- **WHEN** a Telegram-dispatched switch is cancelled (switchSession
+  reports cancellation)
+- **THEN** a short follow-up turn informs the chat that the switch was
+  cancelled and which project remains active
+
+#### Scenario: No stale runtime usage after session replacement
+
+- **WHEN** the confirmation follow-up is sent after a session switch
+- **THEN** it is sent exclusively through the fresh `withSession` context
+  of the new runtime; the invalidated pre-switch `pi`/context objects are
+  never used
+
+### Requirement: Telegram Switch Origin Detection
+
+The extension SHALL detect that `/project <name>` was dispatched from the
+Telegram bridge by observing the raw bridge dispatch on the `input` event
+(first line tagged `[telegram]`, attribute variants allowed, `/project`
+with arguments) and arming a bounded, single-use flag that the next switch
+execution consumes. The flag SHALL have the same lifetime rules as the
+status flag: short time-to-live, cleared on session start.
+
+#### Scenario: Switch flag armed by Telegram dispatch
+
+- **WHEN** the raw prompt `[telegram] /project beta` (or an attribute
+  variant, optionally followed by pi-telegram context sections after a
+  blank line) arrives as an `input` event with source "extension"
+- **THEN** the switch origin flag is armed
+
+#### Scenario: Native switch does not arm the flag
+
+- **WHEN** `/project beta` is invoked from the TUI or RPC surface without a
+  preceding Telegram dispatch
+- **THEN** no flag is armed and the switch behaves exactly as before
+  (local notification only, no confirmation turn)
